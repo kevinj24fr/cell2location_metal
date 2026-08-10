@@ -234,10 +234,15 @@ class RegressionModel(
             add_to_varm = [i for i in add_to_varm if (i not in ["means", "stds"]) and ("q" in i)]
             if len(add_to_varm) == 0:
                 raise ValueError("No quantiles to export - please add add_to_obsm=['q05', 'q50', 'q95'].")
+            # The docstring tells users to put num_samples in sample_kwargs; quantiles
+            # do not sample, and posterior_quantile rejects sampling arguments.
+            quantile_kwargs = {
+                k: v for k, v in sample_kwargs.items() if k not in ("num_samples", "return_samples", "use_gpu")
+            }
             self.samples = dict()
             for i in add_to_varm:
                 q = float(f"0.{i[1:]}")
-                self.samples[f"post_sample_{i}"] = self.posterior_quantile(q=q, **sample_kwargs)
+                self.samples[f"post_sample_{i}"] = self.posterior_quantile(q=q, **quantile_kwargs)
         else:
             # generate samples from posterior distributions for all parameters
             # and compute mean, 5%/95% quantiles and standard deviation
