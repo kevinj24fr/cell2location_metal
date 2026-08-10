@@ -4,6 +4,7 @@ import logging
 import os
 
 from ._compat import prepare_module_for_device
+from ._convergence import EARLY_STOP_ENV_VAR, RelativeEarlyStopping
 from ._device import resolve_accelerator
 from ._dtype import check_anndata_dtype, prepare_anndata
 from ._guard import NumericalGuard
@@ -91,6 +92,16 @@ class AppleSiliconTrainMixin:
     #: inspected afterwards: ``model.numerical_guard_.summary()``.
     numerical_guard_ = None
 
+    #: Convergence-based early stopping for Metal runs: stop when the best ELBO has
+    #: not improved by rel_tol (relative) within patience epochs, never before
+    #: min_epochs. Upstream's fixed 30k epochs keeps training long after the
+    #: plateau. Set to None (or CELL2LOCATION_MPS_EARLY_STOP=0) to disable.
+    mps_early_stopping: dict = {"rel_tol": 1e-4, "patience": 500, "min_epochs": 1000}
+
+    #: Populated when early stopping is active; ``model.early_stopping_.stopped_epoch``
+    #: records where (None if the run reached max_epochs).
+    early_stopping_ = None
+
     def _get_posterior_samples(self, args, kwargs, **sample_kwargs):
         """Vectorized posterior sampling when it is exactly equivalent; loop otherwise.
 
@@ -152,6 +163,13 @@ class AppleSiliconTrainMixin:
         if self.mps_empty_cache_every_n_steps:
             if not any(type(cb).__name__ == "_MPSCacheCallback" for cb in callbacks):
                 callbacks.append(MPSCacheCallback(every_n_steps=self.mps_empty_cache_every_n_steps).as_callback())
+
+        stop_cfg = self.mps_early_stopping
+        env_off = os.environ.get(EARLY_STOP_ENV_VAR, "1").lower() in ("0", "false", "no")
+        if stop_cfg and not env_off:
+            if not any(type(cb).__name__ == "_RelativeEarlyStoppingCallback" for cb in callbacks):
+                self.early_stopping_ = RelativeEarlyStopping(**stop_cfg)
+                callbacks.append(self.early_stopping_.as_callback())
 
         interval = self.mps_numerical_guard_every_n_steps or _guard_interval_from_env()
         if interval and not any(type(cb).__name__ == "_NumericalGuardCallback" for cb in callbacks):
