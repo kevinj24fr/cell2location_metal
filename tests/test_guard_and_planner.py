@@ -334,3 +334,67 @@ def test_unprepared_float64_anndata_trains_anyway():
     model = RegressionModel(adata)
     model.train(max_epochs=2, accelerator="mps", enable_progress_bar=False, enable_model_summary=False)
     assert len(model.history_["elbo_train"]) == 2
+
+
+# --------------------------------------------------------------------------------------
+# device-resident full batch
+# --------------------------------------------------------------------------------------
+
+
+class _CountingPlan:
+    """Stands in for a Lightning training plan; counts real transfers."""
+
+    def __init__(self):
+        self.transfers = 0
+        self.trainer = None
+
+    def transfer_batch_to_device(self, batch, device, dataloader_idx):
+        self.transfers += 1
+        return {k: v for k, v in batch.items()}  # a "moved" copy
+
+
+class _FakeTrainer:
+    def __init__(self, num_training_batches=1, training=True):
+        self.num_training_batches = num_training_batches
+        self.training = training
+
+
+def test_full_batch_is_transferred_once_and_reused():
+    plan_cls = _train.device_cached_plan(_CountingPlan)
+    plan = plan_cls()
+    plan.trainer = _FakeTrainer(num_training_batches=1, training=True)
+
+    batch = {"x": torch.ones(2)}
+    first = plan.transfer_batch_to_device(batch, "mps", 0)
+    second = plan.transfer_batch_to_device(batch, "mps", 0)
+
+    assert plan.transfers == 1, "the 200MB copy must happen exactly once"
+    assert second is first, "every later epoch reuses the device-resident batch"
+
+
+def test_minibatch_epochs_are_never_cached():
+    plan_cls = _train.device_cached_plan(_CountingPlan)
+    plan = plan_cls()
+    plan.trainer = _FakeTrainer(num_training_batches=4, training=True)
+
+    batch = {"x": torch.ones(2)}
+    plan.transfer_batch_to_device(batch, "mps", 0)
+    plan.transfer_batch_to_device(batch, "mps", 0)
+    assert plan.transfers == 2, "shuffled minibatches differ every epoch; caching them would train on stale data"
+
+
+def test_validation_batches_are_never_cached():
+    plan_cls = _train.device_cached_plan(_CountingPlan)
+    plan = plan_cls()
+    plan.trainer = _FakeTrainer(num_training_batches=1, training=False)
+
+    batch = {"x": torch.ones(2)}
+    plan.transfer_batch_to_device(batch, "mps", 0)
+    plan.transfer_batch_to_device(batch, "mps", 0)
+    assert plan.transfers == 2
+
+
+def test_device_cached_plan_is_idempotent():
+    once = _train.device_cached_plan(_CountingPlan)
+    twice = _train.device_cached_plan(once)
+    assert once is twice

@@ -11,7 +11,7 @@ from ._memory import MPSCacheCallback
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["AppleSiliconTrainMixin", "GUARD_ENV_VAR"]
+__all__ = ["AppleSiliconTrainMixin", "GUARD_ENV_VAR", "device_cached_plan"]
 
 #: Set to a step interval (or ``1`` for the default interval) to enable the runtime
 #: divergence guard without changing any code.
@@ -31,6 +31,43 @@ def _guard_interval_from_env() -> int:
     except ValueError:
         logger.warning("%s=%r is not an integer; ignoring.", GUARD_ENV_VAR, raw)
         return 0
+
+
+def device_cached_plan(plan_cls):
+    """Subclass a Lightning training plan so a single-batch epoch is moved to the
+    GPU once and reused.
+
+    Full-batch training re-collates and re-copies the identical dataset every epoch
+    -- 24 ms of a 149 ms epoch at Visium scale, for zero information. Caching is
+    gated at runtime on ``trainer.num_training_batches == 1`` during the training
+    phase: a single-batch epoch has the same content every time (order within the
+    batch is carried by its own index tensor, and the ELBO sums over locations, so
+    even shuffling changes nothing), while genuine minibatches and validation
+    batches always transfer normally.
+    """
+    if getattr(plan_cls, "_c2l_device_cached", False):
+        return plan_cls
+
+    class _DeviceCachedFullBatchPlan(plan_cls):
+        _c2l_device_cached = True
+        _c2l_device_batch = None
+
+        def transfer_batch_to_device(self, batch, device, dataloader_idx):
+            trainer = getattr(self, "trainer", None)
+            cacheable = (
+                trainer is not None
+                and getattr(trainer, "training", False)
+                and getattr(trainer, "num_training_batches", 0) == 1
+            )
+            if not cacheable:
+                return super().transfer_batch_to_device(batch, device, dataloader_idx)
+            if self._c2l_device_batch is None:
+                self._c2l_device_batch = super().transfer_batch_to_device(batch, device, dataloader_idx)
+            return self._c2l_device_batch
+
+    _DeviceCachedFullBatchPlan.__name__ = f"DeviceCached{plan_cls.__name__}"
+    _DeviceCachedFullBatchPlan.__qualname__ = _DeviceCachedFullBatchPlan.__name__
+    return _DeviceCachedFullBatchPlan
 
 
 class AppleSiliconTrainMixin:
@@ -82,6 +119,10 @@ class AppleSiliconTrainMixin:
                 # the full matrix every epoch; converting once here is free speed.
                 logger.info("Metal backend: converting the count matrix to float32 in place.")
                 prepare_anndata(adata, layer=layer)
+
+        plan_cls = getattr(self, "_training_plan_cls", None)
+        if plan_cls is not None:
+            self._training_plan_cls = device_cached_plan(plan_cls)
 
         callbacks = kwargs.setdefault("callbacks", [])
 
