@@ -28,6 +28,7 @@ __all__ = [
     "digamma",
     "lgamma_stirling",
     "log_nb_positive",
+    "eager_log_nb_positive",
     "current_lgamma_mode",
 ]
 
@@ -163,13 +164,30 @@ def log_nb_positive(
         theta = theta.view(1, theta.size(0))
 
     if value.device.type == "mps":
-        # Imported lazily: _fused_nb verifies itself against this very function, so a
-        # module-level import would be circular.
+        # Imported lazily to keep this module importable without _fused_nb and back.
         from ._fused_nb import fused_log_nb_positive
 
         fused = fused_log_nb_positive(value, mu, theta, eps)
         if fused is not None:
             return fused
+
+    return eager_log_nb_positive(value, mu, theta, eps)
+
+
+def eager_log_nb_positive(
+    value: torch.Tensor,
+    mu: torch.Tensor,
+    theta: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """The NB log-likelihood with no kernel dispatch, ever.
+
+    This is the reference the fused Metal kernel verifies itself against, so it must
+    not be able to reach the fused path -- verification calling back into the kernel
+    under verification recurses forever.
+    """
+    if theta.ndimension() == 1:
+        theta = theta.view(1, theta.size(0))
 
     log_theta_mu_eps = torch.log(theta + mu + eps)
 

@@ -157,6 +157,27 @@ def test_prepare_apple_silicon_is_a_noop_off_metal():
     assert "callbacks" not in kwargs
 
 
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs the Metal backend")
+def test_prepare_apple_silicon_downcasts_module_buffers():
+    """Lightning moves the training plan via ``_apply``, which never calls the scvi
+    module's own ``to()`` -- so the CompatMixin interception is bypassed and any
+    float64 buffer (e.g. ``detection_mean_hyp_prior_beta``, built from a NumPy
+    scalar upstream) crashes the move to MPS. train() must downcast beforehand."""
+
+    class _Module(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("hyper", torch.tensor(20.0, dtype=torch.float64))
+
+    class _Model(_train.AppleSiliconTrainMixin):
+        adata_manager = None
+        module = _Module()
+
+    model = _Model()
+    model._prepare_apple_silicon({"accelerator": "mps"})
+    assert model.module.hyper.dtype == torch.float32
+
+
 # --------------------------------------------------------------------------------------
 # the planner
 # --------------------------------------------------------------------------------------

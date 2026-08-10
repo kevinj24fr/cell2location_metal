@@ -3,6 +3,7 @@
 import logging
 import os
 
+from ._compat import prepare_module_for_device
 from ._device import resolve_accelerator
 from ._dtype import check_anndata_dtype
 from ._guard import NumericalGuard
@@ -57,6 +58,14 @@ class AppleSiliconTrainMixin:
         _, device = resolve_accelerator(kwargs.get("accelerator", "auto"), kwargs.get("device", "auto"))
         if device.type != "mps":
             return
+
+        # Lightning moves the training plan with ``_apply``, which recurses into
+        # child modules without ever calling their ``to()`` -- so the CompatMixin
+        # interception never fires on this path and float64 buffers reach the MPS
+        # move intact. Downcast here, while everything is still on the CPU.
+        module = getattr(self, "module", None)
+        if module is not None:
+            prepare_module_for_device(module, device)
 
         adata = getattr(self, "adata_manager", None)
         adata = getattr(adata, "adata", None)

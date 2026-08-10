@@ -23,7 +23,7 @@ from cell2location.accel._fused_nb import (
     reset_fused_nb_state,
     verify_fused_kernel,
 )
-from cell2location.accel._ops import log_nb_positive as eager_log_nb_positive
+from cell2location.accel._ops import eager_log_nb_positive, log_nb_positive
 
 
 @pytest.fixture(autouse=True)
@@ -290,3 +290,33 @@ def test_shader_gradient_formulae_match_autograd():
 
     assert torch.allclose(mu.grad, expected_grad_mu, rtol=1e-8, atol=1e-10)
     assert torch.allclose(theta.grad, expected_grad_theta, rtol=1e-8, atol=1e-10)
+
+
+# --------------------------------------------------------------------------------------
+# the real kernel, end to end
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs the Metal backend")
+@pytest.mark.skipif(not hasattr(getattr(torch, "mps", object()), "compile_shader"), reason="needs compile_shader")
+def test_real_kernel_compiles_verifies_and_engages_on_mps(monkeypatch):
+    """enable -> first dispatch -> compile -> verify -> use, on the actual GPU.
+
+    Two ways this has broken before: the verification's eager reference dispatched
+    back into the kernel being verified (infinite recursion), and the comparison
+    widened MPS tensors to float64, which MPS refuses -- either way the kernel
+    never engages on the hardware it was written for.
+    """
+    monkeypatch.setenv(_fused_nb.FUSED_NB_ENV_VAR, "1")
+
+    torch.manual_seed(0)
+    value = torch.poisson(torch.full((64, 128), 5.0))
+    mu = torch.rand(64, 128) * 20 + 0.1
+    theta = torch.rand(1, 128) * 10 + 0.1
+
+    result = log_nb_positive(value.to("mps"), mu.to("mps"), theta.to("mps"))
+    reference = log_nb_positive(value, mu, theta)
+    assert torch.allclose(result.cpu(), reference, rtol=1e-4, atol=1e-4)
+
+    status = _fused_nb.fused_nb_status()
+    assert status["verified"] is True, status

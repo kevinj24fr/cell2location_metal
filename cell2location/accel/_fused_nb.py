@@ -33,7 +33,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
 
-from ._ops import log_nb_positive as _eager_log_nb_positive
+from ._ops import eager_log_nb_positive as _eager_log_nb_positive
 
 logger = logging.getLogger(__name__)
 
@@ -319,7 +319,7 @@ def verify_fused_kernel(
 def _compare(a: Optional[torch.Tensor], b: Optional[torch.Tensor], rtol: float, atol: float) -> Tuple[bool, str]:
     if a is None or b is None:
         return False, "a gradient was not produced"
-    a64, b64 = a.detach().double().cpu(), b.detach().double().cpu()
+    a64, b64 = a.detach().cpu().double(), b.detach().cpu().double()
     diff = (a64 - b64).abs()
     budget = atol + rtol * b64.abs()
     if bool((diff <= budget).all()):
