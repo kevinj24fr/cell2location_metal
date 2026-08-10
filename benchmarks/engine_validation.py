@@ -64,22 +64,27 @@ def main():
     key = next(k for k in out_fast.obsm if k.startswith("means"))
     fast = {k: np.asarray(out_fast.obsm[k]) for k in out_fast.obsm}
 
-    from cell2location.accel import _sampling
-
-    orig = _sampling.vectorized_posterior_samples
-
-    def _refuse(*a, **k):
-        raise _sampling.NotVectorizable("forced looped baseline")
-
-    _sampling.vectorized_posterior_samples = _refuse
-    out_slow = model.export_posterior(adata, sample_kwargs={"num_samples": 1000, "batch_size": adata.n_obs})
-    _sampling.vectorized_posterior_samples = orig
-
+    # The fast/looped parity comparison only exists on checkouts that HAVE the fast
+    # path. On a baseline checkout (master), the single export above already ran the
+    # looped sampler; record it and skip parity.
     parity = {}
-    for k in fast:
-        if k in out_slow.obsm:
-            s = np.asarray(out_slow.obsm[k])
-            parity[k] = float(np.median(np.abs(fast[k] - s) / (np.abs(s) + 1e-6)))
+    try:
+        from cell2location.accel import _sampling
+    except ImportError:
+        _sampling = None
+    if _sampling is not None:
+        orig = _sampling.vectorized_posterior_samples
+
+        def _refuse(*a, **k):
+            raise _sampling.NotVectorizable("forced looped baseline")
+
+        _sampling.vectorized_posterior_samples = _refuse
+        out_slow = model.export_posterior(adata, sample_kwargs={"num_samples": 1000, "batch_size": adata.n_obs})
+        _sampling.vectorized_posterior_samples = orig
+        for k in fast:
+            if k in out_slow.obsm:
+                s = np.asarray(out_slow.obsm[k])
+                parity[k] = float(np.median(np.abs(fast[k] - s) / (np.abs(s) + 1e-6)))
 
     metrics = {"train_ms_per_epoch": train_ms, "final_elbo": elbo, "guard": guard,
                "export_seconds": export_s, "export_parity_median_rel": parity}
