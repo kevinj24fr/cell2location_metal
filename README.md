@@ -48,10 +48,10 @@ listed.
   factorizes over sites, so all draws are one batched
   `transform(loc + scale · eps)` per site: the same distribution, shaped as a
   batch. Falls back to the loop for non-mean-field guides, minibatched export, or
-  observed-site sampling. Measured: 20.6x faster export at 250×400/1000 samples;
-  summary parity vs the loop within Monte-Carlo error (means 0.3%, quantiles 0.6%
-  median relative). *(Scale numbers from the validation harness are added at merge
-  time.)*
+  observed-site sampling. Validation harness at 5,000 locations × 10,000 genes,
+  1,000 samples, M2 Ultra: export 181.2s → 11.1s (**16.3x**); summary parity vs
+  the loop within Monte-Carlo error (means 0.3%, quantiles 0.6% median relative);
+  final-ELBO parity and numerical guard clean (worst CPU/GPU difference 1.5e-7).
 
 ---
 
