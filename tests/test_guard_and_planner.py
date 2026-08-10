@@ -5,12 +5,29 @@ Testing it against a device that agrees would prove nothing, so the divergence i
 injected directly.
 """
 
+import logging
+
 import pytest
 import torch
 
 from cell2location.accel import _planner, _train
 from cell2location.accel._guard import NumericalGuard
 from cell2location.accel._planner import plan_memory
+
+
+@pytest.fixture
+def propagating_c2l_logs():
+    """cell2location's package logger sets propagate=False (it prints via its own rich
+    handler), which hides its records from pytest's caplog handler on the root logger.
+    Re-enable propagation for the duration of tests that assert on log records."""
+    logger = logging.getLogger("cell2location")
+    original = logger.propagate
+    logger.propagate = True
+    try:
+        yield
+    finally:
+        logger.propagate = original
+
 
 # --------------------------------------------------------------------------------------
 # the guard
@@ -50,7 +67,7 @@ def test_guard_summary_is_safe_before_any_check():
     assert not guard.diverged
 
 
-def test_guard_warning_is_rate_limited(caplog):
+def test_guard_warning_is_rate_limited(caplog, propagating_c2l_logs):
     """A diverged 30k-step run must not emit thirty identical warnings."""
     guard = NumericalGuard(tolerance=1e-6, max_warnings=2)
 
@@ -122,7 +139,7 @@ def test_guard_env_var_parsing(monkeypatch):
     assert _train._guard_interval_from_env() == 0
 
 
-def test_guard_env_var_ignores_nonsense(monkeypatch, caplog):
+def test_guard_env_var_ignores_nonsense(monkeypatch, caplog, propagating_c2l_logs):
     monkeypatch.setenv(_train.GUARD_ENV_VAR, "sometimes")
     with caplog.at_level("WARNING"):
         assert _train._guard_interval_from_env() == 0

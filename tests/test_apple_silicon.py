@@ -206,14 +206,15 @@ def test_lgamma_mode_env_var_is_validated(monkeypatch):
 @pytest.mark.parametrize("mode", ["contiguous", "stirling", "cpu"])
 def test_lgamma_on_broadcast_view_matches_cpu(mode):
     """The exact shape that has historically been miscomputed on MPS."""
-    base = torch.rand(1, 2000, dtype=torch.float32) * 50 + 1e-3
+    generator = torch.Generator().manual_seed(0)
+    base = torch.rand(1, 2000, generator=generator, dtype=torch.float32) * 50 + 1e-3
     broadcast = base.expand(512, 2000)
 
     reference = torch.lgamma(broadcast.double().contiguous())
-    result = _ops.lgamma(broadcast.to("mps"), mode=mode).double().cpu()
+    result = _ops.lgamma(broadcast.to("mps"), mode=mode).cpu()
 
-    rel_error = ((result - reference).abs() / reference.abs().clamp_min(1e-6)).max()
-    assert rel_error < 1e-4, f"mode={mode} max rel error {rel_error:.3e}"
+    max_abs, ok = _max_error(result, reference, rtol=1e-5, atol=1e-5)
+    assert ok, f"mode={mode} max abs error {max_abs:.3e}"
 
 
 # --------------------------------------------------------------------------------------
