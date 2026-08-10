@@ -20,6 +20,19 @@ GUARD_ENV_VAR = "CELL2LOCATION_MPS_GUARD"
 
 _DEFAULT_GUARD_INTERVAL = 1000
 
+#: Train kwargs the flat engine implements (or checks and matches exactly). Anything
+#: else present routes training to the pyro path.
+_FLAT_HANDLED_TRAIN_KWARGS = frozenset(
+    {
+        "max_epochs", "batch_size", "train_size", "lr", "accelerator", "device",
+        "plan_kwargs", "callbacks", "enable_progress_bar", "enable_model_summary",
+    }
+)
+
+#: Callbacks whose behavior the flat engine reproduces itself (early stopping) or
+#: that a full-batch flat run does not need (periodic MPS cache release).
+_FLAT_EQUIVALENT_CALLBACKS = frozenset({"_MPSCacheCallback", "_RelativeEarlyStoppingCallback"})
+
 
 def _guard_interval_from_env() -> int:
     raw = os.environ.get(GUARD_ENV_VAR, "0").strip().lower()
@@ -105,6 +118,70 @@ class AppleSiliconTrainMixin:
     #: Populated when early stopping is active; ``model.early_stopping_.stopped_epoch``
     #: records where (None if the run reached max_epochs).
     early_stopping_ = None
+
+    #: torch.compile the flat engine's step function (eager fallback on failure).
+    #: Off by default: at torch 2.12 inductor fuses the flat loss into a single
+    #: Metal kernel whose input count exceeds Metal's 31-constant-buffer limit, so
+    #: compilation always fails and the attempt costs seconds per train() call.
+    #: Revisit alongside the fused mu/alpha kernel (packing the module's ~30 scalar
+    #: hyperparameter buffers into one tensor removes the cause).
+    mps_flat_compile: bool = False
+
+    #: True when the last ``train()`` ran on the flat engine rather than pyro.
+    flat_engine_used_ = False
+
+    def _flat_train_if_applicable(self, kwargs: dict) -> bool:
+        """Train with the flat engine when its verified scope holds; False otherwise.
+
+        Scope: MPS device, full batch, single-particle unscaled Trace_ELBO, default
+        optimizer, an AutoNormal guide, no dropout, no initial-value branches. Any
+        miss -- including a divergence mid-run -- leaves training to the pyro path.
+        """
+        from ._flat_train import FLAT_ENGINE_ENV_VAR, run_flat_training
+        from ._sampling import NotVectorizable
+
+        self.flat_engine_used_ = False
+        if os.environ.get(FLAT_ENGINE_ENV_VAR, "1").strip().lower() in ("0", "false", "no"):
+            return False
+        # Any train kwarg the flat engine does not implement routes to pyro rather
+        # than being silently ignored. scvi's load() warmup depends on this: it
+        # calls train(max_steps=1), and an engine that ignores max_steps would
+        # retrain a freshly loaded model to convergence.
+        unknown = set(kwargs) - _FLAT_HANDLED_TRAIN_KWARGS
+        if unknown:
+            logger.info("Flat engine: unhandled train kwargs %s; training through pyro.", sorted(unknown))
+            return False
+        _, device = resolve_accelerator(kwargs.get("accelerator", "auto"), kwargs.get("device", "auto"))
+        if device.type != "mps":
+            return False
+        if kwargs.get("batch_size") is not None or kwargs.get("train_size", 1) != 1:
+            return False
+        callbacks = kwargs.get("callbacks") or []
+        if any(type(cb).__name__ not in _FLAT_EQUIVALENT_CALLBACKS for cb in callbacks):
+            # Unrecognized callbacks (including the replay-based numerical guard,
+            # which has no flat equivalent yet) need the Lightning loop.
+            return False
+        plan = kwargs.get("plan_kwargs") or {}
+        loss_fn = plan.get("loss_fn")
+        if loss_fn is not None and (
+            type(loss_fn).__name__ != "Trace_ELBO" or getattr(loss_fn, "num_particles", 1) != 1
+        ):
+            return False
+        if plan.get("scale_elbo", 1.0) != 1.0 or "optim" in plan or "optim_kwargs" in plan:
+            return False
+        pyro_model = getattr(self.module, "model", None)
+        if getattr(pyro_model, "np_init_vals", None) is not None:
+            return False
+        if getattr(pyro_model, "dropout_p", 0.0):
+            return False
+        if getattr(pyro_model, "training_wo_observed", False):
+            return False
+        try:
+            self.flat_engine_used_ = run_flat_training(self, kwargs)
+        except NotVectorizable as exc:
+            logger.info("Flat engine unavailable (%s); training through pyro.", exc)
+            return False
+        return self.flat_engine_used_
 
     def _get_posterior_samples(self, args, kwargs, **sample_kwargs):
         """Vectorized posterior sampling when it is exactly equivalent; loop otherwise.

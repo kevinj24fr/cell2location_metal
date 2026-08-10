@@ -251,6 +251,8 @@ class Cell2location(
 
         self._prepare_apple_silicon(kwargs)
 
+        if self._flat_train_if_applicable(kwargs):
+            return
         super().train(**kwargs)
 
     def train_aggressive(
