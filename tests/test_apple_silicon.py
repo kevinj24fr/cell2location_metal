@@ -322,3 +322,78 @@ def test_compile_is_disabled_on_mps_by_default(monkeypatch):
 def test_compile_can_be_force_enabled_on_mps(monkeypatch):
     monkeypatch.setenv("CELL2LOCATION_ALLOW_MPS_COMPILE", "1")
     assert accel.compile_is_safe("mps") is True
+
+
+# --------------------------------------------------------------------------------------
+# GammaPoisson routing
+# --------------------------------------------------------------------------------------
+
+
+def test_gamma_poisson_is_bit_identical_to_pyro_on_cpu():
+    """Off Metal the subclass must not change training arithmetic at all."""
+    import pyro.distributions as dist
+
+    from cell2location.accel import GammaPoisson
+
+    torch.manual_seed(0)
+    value = torch.poisson(torch.full((64, 128), 5.0))
+    alpha = torch.rand(1, 128) * 10 + 0.1
+    mu = torch.rand(64, 128) * 20 + 0.1
+
+    ours = GammaPoisson(concentration=alpha, rate=alpha / mu).log_prob(value)
+    pyros = dist.GammaPoisson(concentration=alpha, rate=alpha / mu).log_prob(value)
+    assert torch.equal(ours, pyros)
+
+
+@requires_mps
+def test_gamma_poisson_on_mps_matches_cpu_reference():
+    import pyro.distributions as dist
+
+    from cell2location.accel import GammaPoisson
+
+    torch.manual_seed(0)
+    value = torch.poisson(torch.full((64, 128), 5.0))
+    alpha = torch.rand(1, 128) * 10 + 0.1
+    mu = torch.rand(64, 128) * 20 + 0.1
+
+    reference = dist.GammaPoisson(concentration=alpha, rate=alpha / mu).log_prob(value)
+    result = GammaPoisson(
+        concentration=alpha.to("mps"), rate=(alpha / mu).to("mps")
+    ).log_prob(value.to("mps"))
+
+    max_abs, ok = _max_error(result.cpu(), reference, rtol=1e-4, atol=1e-4)
+    assert ok, f"max abs error {max_abs:.3e}"
+
+
+@requires_mps
+def test_gamma_poisson_survives_plate_expansion():
+    """Pyro plates call expand(), whose base implementation hardcodes the parent
+    class -- losing the subclass would silently lose the Metal routing."""
+    import pyro.distributions as dist
+
+    from cell2location.accel import GammaPoisson
+
+    torch.manual_seed(0)
+    value = torch.poisson(torch.full((64, 128), 5.0))
+    alpha = torch.rand(1, 128) * 10 + 0.1
+    mu = torch.rand(64, 128) * 20 + 0.1
+
+    expanded = GammaPoisson(
+        concentration=alpha.to("mps"), rate=(alpha / mu).to("mps")
+    ).expand(torch.Size([64, 128]))
+    assert type(expanded) is GammaPoisson
+
+    reference = dist.GammaPoisson(concentration=alpha, rate=alpha / mu).log_prob(value)
+    max_abs, ok = _max_error(expanded.log_prob(value.to("mps")).cpu(), reference, rtol=1e-4, atol=1e-4)
+    assert ok, f"max abs error {max_abs:.3e}"
+
+
+def test_spatial_modules_use_the_routed_gamma_poisson():
+    """The whole point: the training likelihood must go through accel dispatch."""
+    import inspect
+
+    from cell2location.models import _cell2location_module
+
+    source = inspect.getsource(_cell2location_module)
+    assert "dist.GammaPoisson(" not in source
+    assert "GammaPoisson(" in source

@@ -4,6 +4,8 @@ import numpy as np
 import pandas as pd
 import pyro
 import pyro.distributions as dist
+
+from cell2location.accel import GammaPoisson
 import torch
 from pyro.nn import PyroModule
 from scipy.sparse import csr_matrix
@@ -484,7 +486,7 @@ class LocationModelWTAMultiExperimentHierarchicalGeneLevel(PyroModule):
             with obs_plate:
                 pyro.sample(
                     "data_target",
-                    dist.GammaPoisson(concentration=alpha, rate=alpha / mu),
+                    GammaPoisson(concentration=alpha, rate=alpha / mu),
                     obs=torch.concat([neg_data, x_data], axis=1),
                 )
 

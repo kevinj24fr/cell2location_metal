@@ -2,6 +2,8 @@ import numpy as np
 import pandas as pd
 import pyro
 import pyro.distributions as dist
+
+from cell2location.accel import GammaPoisson
 import torch
 from pyro.nn import PyroModule
 from scvi import REGISTRY_KEYS
@@ -336,7 +338,7 @@ class LocationModelLinearDependentWMultiExperimentLocationBackgroundNormLevelNoM
         with obs_plate:
             pyro.sample(
                 "data_target",
-                dist.GammaPoisson(concentration=alpha, rate=alpha / mu),
+                GammaPoisson(concentration=alpha, rate=alpha / mu),
                 # dist.NegativeBinomial(total_count=total_count, logits=logits),
                 obs=x_data,
             )

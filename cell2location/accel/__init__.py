@@ -69,11 +69,13 @@ from ._memory import (
     empty_cache,
     memory_summary,
 )
+from ._gamma_poisson import GammaPoisson
 from ._ops import (
     LGAMMA_MODE_ENV_VAR,
     LGAMMA_MODES,
     current_lgamma_mode,
     digamma,
+    eager_log_nb_positive,
     lgamma,
     lgamma_stirling,
     log_nb_positive,
@@ -127,6 +129,8 @@ __all__ = [
     "lgamma",
     "lgamma_stirling",
     "log_nb_positive",
+    "eager_log_nb_positive",
+    "GammaPoisson",
     "memory_summary",
     "mps_is_available",
     "mps_is_disabled",
