@@ -312,16 +312,19 @@ def test_module_with_float64_buffers_moves_to_mps():
     assert module.hyperparameter.dtype == torch.float32
 
 
-def test_compile_is_disabled_on_mps_by_default(monkeypatch):
+def test_compile_is_allowed_on_mps_by_default(monkeypatch):
+    """train_compiled() is already an explicit opt-in; requiring an env var on top
+    of it was hostile. Measured on M2 Ultra / torch 2.12: inductor's Metal backend
+    matches the hand-written fused kernel on the NB likelihood."""
     monkeypatch.delenv("CELL2LOCATION_ALLOW_MPS_COMPILE", raising=False)
     assert accel.compile_is_safe("cpu") is True
-    if mps_available:
-        assert accel.compile_is_safe("mps") is False
-
-
-def test_compile_can_be_force_enabled_on_mps(monkeypatch):
-    monkeypatch.setenv("CELL2LOCATION_ALLOW_MPS_COMPILE", "1")
     assert accel.compile_is_safe("mps") is True
+
+
+def test_compile_can_be_disabled_on_mps(monkeypatch):
+    monkeypatch.setenv("CELL2LOCATION_ALLOW_MPS_COMPILE", "0")
+    assert accel.compile_is_safe("mps") is False
+    assert accel.compile_is_safe("cpu") is True, "the kill switch is Metal-specific"
 
 
 # --------------------------------------------------------------------------------------

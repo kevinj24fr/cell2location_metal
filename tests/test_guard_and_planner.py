@@ -264,3 +264,73 @@ def test_planner_output_is_readable_and_serialisable():
 def test_planner_safety_fraction_leaves_real_headroom():
     """Unified memory means overshooting swaps the whole machine, not just the job."""
     assert 0.5 <= _planner._SAFETY_FRACTION <= 0.85
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs the Metal backend")
+def test_guard_actually_checks_during_real_training():
+    """The guard silently recorded zero checks for its entire life: the CPU
+    reference evaluated a deep copy whose PyroModule params still resolved to the
+    global (MPS) param store, the resulting device-mix error was swallowed at debug
+    level, and every check returned None. A guard that cannot fail is worse than no
+    guard -- this test pins the whole loop: real model, real Lightning run, checks
+    recorded, agreement within tolerance."""
+    scvi_data = pytest.importorskip("scvi.data")
+    import numpy as np
+
+    from cell2location.models import RegressionModel
+
+    torch.manual_seed(0)
+    np.random.seed(0)
+    adata = scvi_data.synthetic_iid(n_labels=3, batch_size=100, n_genes=60)
+    from cell2location.accel import prepare_anndata
+
+    prepare_anndata(adata)
+    RegressionModel.setup_anndata(adata, labels_key="labels", batch_key="batch")
+    model = RegressionModel(adata)
+    model.mps_numerical_guard_every_n_steps = 2
+    model.train(
+        max_epochs=6,
+        accelerator="mps",
+        enable_progress_bar=False,
+        enable_model_summary=False,
+    )
+
+    summary = model.numerical_guard_.summary()
+    assert summary["checks"] >= 2, summary
+    assert not summary["diverged"], summary
+    # A NaN difference reads as agreement through every ">" comparison; requiring a
+    # finite in-tolerance maximum is what actually pins "the devices agree".
+    import math
+
+    assert math.isfinite(summary["max_relative_difference"]), summary
+    assert summary["max_relative_difference"] < 1e-3, summary
+
+
+def test_guard_treats_non_finite_losses_as_divergence():
+    """An inf/NaN loss is the strongest possible disagreement, not a skipped check."""
+    guard = NumericalGuard(tolerance=1e-3)
+    guard.history = [
+        {"step": 0, "device_loss": 1.0, "reference_loss": 1.0, "relative_difference": float("inf")},
+    ]
+    assert guard.diverged
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs the Metal backend")
+def test_unprepared_float64_anndata_trains_anyway():
+    """Zero-config: a float64 count matrix must be converted at train time, not
+    warned about and then crashed on. Users should never need to know
+    prepare_anndata() exists."""
+    scvi_data = pytest.importorskip("scvi.data")
+    import numpy as np
+
+    from cell2location.models import RegressionModel
+
+    torch.manual_seed(0)
+    np.random.seed(0)
+    adata = scvi_data.synthetic_iid(n_labels=3, batch_size=100, n_genes=60)
+    adata.X = np.asarray(adata.X, dtype=np.float64)
+
+    RegressionModel.setup_anndata(adata, labels_key="labels", batch_key="batch")
+    model = RegressionModel(adata)
+    model.train(max_epochs=2, accelerator="mps", enable_progress_bar=False, enable_model_summary=False)
+    assert len(model.history_["elbo_train"]) == 2

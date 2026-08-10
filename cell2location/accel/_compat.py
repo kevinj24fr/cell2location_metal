@@ -64,10 +64,11 @@ class AppleSiliconCompatMixin:
 def compile_is_safe(device: Any = None) -> bool:
     """Whether ``torch.compile`` should be used on ``device``.
 
-    TorchInductor's Metal path is considerably newer than its CUDA path, and the
-    graphs Pyro produces (dynamic shapes, effectful sites, data-dependent control
-    flow in the guide) are exactly the ones most likely to fall over. Returning
-    ``False`` here makes ``train_compiled`` degrade to eager rather than fail.
+    Allowed on Metal by default: on torch >= 2.12, TorchInductor's Metal backend
+    compiles the Pyro graphs cell2location produces and matches the fused kernel's
+    arithmetic (verified against CPU by the numerical guard, which compiled Metal
+    runs arm automatically). ``CELL2LOCATION_ALLOW_MPS_COMPILE=0`` is the kill
+    switch that makes ``train_compiled`` degrade to eager rather than compile.
     """
     device = torch.device(device) if device is not None else None
     on_mps = (device is not None and device.type == "mps") or (device is None and mps_is_available())
@@ -76,5 +77,5 @@ def compile_is_safe(device: Any = None) -> bool:
 
     import os
 
-    override = os.environ.get("CELL2LOCATION_ALLOW_MPS_COMPILE", "0").lower()
+    override = os.environ.get("CELL2LOCATION_ALLOW_MPS_COMPILE", "1").lower()
     return override in ("1", "true", "yes")

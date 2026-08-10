@@ -105,7 +105,11 @@ def disable_fused_nb() -> None:
 
 
 def fused_nb_enabled() -> bool:
-    return os.environ.get(FUSED_NB_ENV_VAR, "0").lower() in ("1", "true", "yes")
+    """On by default. Safe as a default because the kernel never runs unverified:
+    the first dispatch compares it against the eager implementation, forward and
+    gradients, and permanently rejects it for the process on any mismatch. Set
+    ``CELL2LOCATION_MPS_FUSED_NB=0`` to force the eager path."""
+    return os.environ.get(FUSED_NB_ENV_VAR, "1").lower() in ("1", "true", "yes")
 
 
 def fused_nb_status() -> Dict[str, Any]:

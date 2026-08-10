@@ -18,6 +18,7 @@ This is cheap insurance against the one thing you cannot otherwise detect.
 """
 
 import logging
+import math
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -33,79 +34,94 @@ def compare_loss_across_devices(
     kwargs,
     reference_device: str = "cpu",
 ) -> Optional[Dict[str, float]]:
-    """Evaluate the same loss on the module's device and on ``reference_device``.
+    """Evaluate the same ELBO term on the module's device and on ``reference_device``.
+
+    The guide is traced once on the training device, and the *same* sampled latents
+    are then replayed through the model on both devices; the quantity compared is
+    the model log-joint (data likelihood plus priors) under identical latents. That
+    is deterministic -- any disagreement is arithmetic, never sampling -- and it is
+    precisely the arithmetic the accelerated kernels compute. The guide's own
+    log-density is deliberately excluded: autoguides record constrained sites as
+    ``Delta`` distributions whose log-prob is an exact equality test, so recomputing
+    the transform on another device fails on one-ulp differences by construction.
+
+    The module itself is moved for the reference evaluation and moved back whatever
+    happens. Moving, not copying, is load-bearing: PyroModule parameters resolve
+    through the global param store at trace time, so any copy -- however deep --
+    still reads tensors living on the original device.
 
     Returns ``None`` when the comparison cannot be made (module already on the
-    reference device, or the loss is not reproducible). Otherwise returns the two
-    values and their relative difference.
-
-    The module is moved back to its original device before returning, whatever
-    happens -- a diagnostic that leaves training on the wrong device would be worse
-    than no diagnostic.
+    reference device, or an evaluation failed). Otherwise returns both values and
+    their relative difference.
     """
+    import pyro
+
     from ._device import device_of
 
     original_device = device_of(module)
     if original_device.type == reference_device:
         return None
 
-    seed = torch.randint(0, 2**31 - 1, (1,)).item()
-
     try:
-        torch.manual_seed(seed)
         with torch.no_grad():
-            device_loss = float(_evaluate_loss(module, args, kwargs))
+            guide_trace = pyro.poutine.trace(module.guide).get_trace(*args, **kwargs)
+            model_trace = pyro.poutine.trace(pyro.poutine.replay(module.model, trace=guide_trace)).get_trace(
+                *args, **kwargs
+            )
+            device_loss = float(model_trace.log_prob_sum())
     except Exception as exc:  # noqa: BLE001
         logger.debug("Numerical guard: could not evaluate on %s (%s).", original_device, exc)
         return None
 
     try:
-        cpu_module = _shallow_cpu_copy(module)
-        cpu_args = [a.cpu() if isinstance(a, torch.Tensor) else a for a in args]
-        cpu_kwargs = {k: (v.cpu() if isinstance(v, torch.Tensor) else v) for k, v in kwargs.items()}
+        reference_trace = _sample_values_to(guide_trace, reference_device)
+        ref_args = [a.to(reference_device) if isinstance(a, torch.Tensor) else a for a in args]
+        ref_kwargs = {k: (v.to(reference_device) if isinstance(v, torch.Tensor) else v) for k, v in kwargs.items()}
 
-        torch.manual_seed(seed)
-        with torch.no_grad():
-            reference_loss = float(_evaluate_loss(cpu_module, cpu_args, cpu_kwargs))
+        module.to(reference_device)
+        try:
+            with torch.no_grad():
+                ref_model_trace = pyro.poutine.trace(pyro.poutine.replay(module.model, trace=reference_trace)).get_trace(
+                    *ref_args, **ref_kwargs
+                )
+                reference_loss = float(ref_model_trace.log_prob_sum())
+        finally:
+            module.to(original_device)
     except Exception as exc:  # noqa: BLE001
         logger.debug("Numerical guard: could not evaluate on %s (%s).", reference_device, exc)
         return None
 
     scale = max(abs(reference_loss), 1e-12)
+    relative_difference = abs(device_loss - reference_loss) / scale
+    if not math.isfinite(relative_difference):
+        # A NaN would sail through every ``>`` comparison and read as agreement --
+        # the one thing a guard must never do. Any non-finite loss is a divergence.
+        relative_difference = float("inf")
     return {
         "device_loss": device_loss,
         "reference_loss": reference_loss,
-        "relative_difference": abs(device_loss - reference_loss) / scale,
+        "relative_difference": relative_difference,
     }
 
 
-def _evaluate_loss(module, args, kwargs):
-    """Run the module's ELBO once.
+def _sample_values_to(trace, device):
+    """A minimal trace holding only the sample sites' values, moved to ``device``.
 
-    Pyro's ``Trace_ELBO`` is stochastic, which is precisely why the caller reseeds
-    before each evaluation: with the same seed and the same parameters, the two
-    devices should draw the same values and land on the same number.
+    Replay reads nothing but ``nodes[name]["value"]`` for sample sites; carrying the
+    original distribution objects over would drag their device tensors along.
     """
-    import pyro
+    from pyro.poutine.trace_struct import Trace
 
-    guide_trace = pyro.poutine.trace(module.guide).get_trace(*args, **kwargs)
-    model_trace = pyro.poutine.trace(pyro.poutine.replay(module.model, trace=guide_trace)).get_trace(*args, **kwargs)
-
-    return model_trace.log_prob_sum() - guide_trace.log_prob_sum()
-
-
-def _shallow_cpu_copy(module):
-    """A CPU view of the module that shares nothing mutable with the original.
-
-    ``copy.deepcopy`` on a Pyro module drags along the param store and the guide's
-    lazily-constructed state, which is both slow and fragile. Moving a detached copy
-    of the state dict onto a fresh CPU instance is enough for a forward pass.
-    """
-    import copy
-
-    cpu_module = copy.deepcopy(module).cpu()
-    cpu_module.eval()
-    return cpu_module
+    moved = Trace()
+    for name, node in trace.nodes.items():
+        if node.get("type") != "sample":
+            continue
+        new_node = dict(node)
+        value = node.get("value")
+        if isinstance(value, torch.Tensor):
+            new_node["value"] = value.detach().to(device)
+        moved.add_node(name, **new_node)
+    return moved
 
 
 class NumericalGuard:

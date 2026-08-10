@@ -5,7 +5,7 @@ import os
 
 from ._compat import prepare_module_for_device
 from ._device import resolve_accelerator
-from ._dtype import check_anndata_dtype
+from ._dtype import check_anndata_dtype, prepare_anndata
 from ._guard import NumericalGuard
 from ._memory import MPSCacheCallback
 
@@ -67,14 +67,21 @@ class AppleSiliconTrainMixin:
         if module is not None:
             prepare_module_for_device(module, device)
 
-        adata = getattr(self, "adata_manager", None)
-        adata = getattr(adata, "adata", None)
-        if adata is not None and not check_anndata_dtype(adata):
-            logger.warning(
-                "The count matrix is not float32. The Metal backend has no float64 kernels, so "
-                "moving minibatches to the GPU will raise. Fix it once, before setup_anndata(), with "
-                "`cell2location.accel.prepare_anndata(adata)`."
-            )
+        manager = getattr(self, "adata_manager", None)
+        adata = getattr(manager, "adata", None)
+        if adata is not None:
+            layer = None
+            try:
+                registry = manager.data_registry["X"]
+                if registry.attr_name == "layers":
+                    layer = registry.attr_key
+            except Exception:  # noqa: BLE001 - registry layouts vary across scvi versions
+                layer = None
+            if not check_anndata_dtype(adata, layer=layer):
+                # Not a crash risk (scvi casts per batch), but that cast re-runs over
+                # the full matrix every epoch; converting once here is free speed.
+                logger.info("Metal backend: converting the count matrix to float32 in place.")
+                prepare_anndata(adata, layer=layer)
 
         callbacks = kwargs.setdefault("callbacks", [])
 

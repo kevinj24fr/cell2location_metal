@@ -174,12 +174,12 @@ class Cell2location(
     def train_compiled(self, compile_mode=None, compile_dynamic=None, compile_backend=None, **kwargs):
         """Train with ``torch.compile`` applied to the model and guide.
 
-        On Apple silicon this degrades to eager execution unless
-        ``CELL2LOCATION_ALLOW_MPS_COMPILE=1`` is set. TorchInductor's Metal path is
-        much younger than its CUDA path, and the graphs Pyro emits -- dynamic plate
-        sizes, effectful sample sites, control flow inside the guide -- are the ones
-        most likely to break it. Silently training 30k steps on a miscompiled graph
-        is a worse outcome than not compiling.
+        Works on Apple silicon (torch >= 2.12; inductor's Metal backend matches the
+        fused kernel's arithmetic). Because a miscompiled graph would produce
+        plausible-looking but wrong losses, compiled Metal runs arm the numerical
+        guard automatically unless one is already configured -- the loss is
+        cross-checked against the CPU during training and divergence is reported.
+        ``CELL2LOCATION_ALLOW_MPS_COMPILE=0`` forces eager execution instead.
         """
         _, device = resolve_accelerator(kwargs.get("accelerator", "auto"), kwargs.get("device", "auto"))
 
@@ -187,11 +187,14 @@ class Cell2location(
 
         if not compile_is_safe(device):
             logger.warning(
-                "torch.compile is not enabled on the Metal backend by default; continuing in eager mode. "
-                "Set CELL2LOCATION_ALLOW_MPS_COMPILE=1 to override."
+                "torch.compile disabled on the Metal backend (CELL2LOCATION_ALLOW_MPS_COMPILE=0); "
+                "continuing in eager mode."
             )
             self.train(**kwargs)
             return
+
+        if device.type == "mps" and not self.mps_numerical_guard_every_n_steps:
+            self.mps_numerical_guard_every_n_steps = 1000
 
         compile_kwargs = dict(mode=compile_mode, dynamic=compile_dynamic)
         if compile_backend is not None:

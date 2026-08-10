@@ -137,8 +137,18 @@ def test_gate_reports_where_the_error_is():
 # --------------------------------------------------------------------------------------
 
 
-def test_disabled_by_default():
+def test_enabled_by_default_behind_the_verification_gate():
+    """Zero-config: the kernel is on by default. Safe because the first dispatch
+    verifies it against eager and permanently rejects it on any mismatch."""
+    assert _fused_nb.fused_nb_enabled() is True
+    assert fused_nb_status()["requested"] is True
+    # ...but never off Metal: CPU tensors bypass the kernel entirely.
     assert fused_log_nb_positive(torch.ones(2, 2), torch.ones(2, 2), torch.ones(1, 2)) is None
+
+
+def test_explicit_disable_wins(monkeypatch):
+    monkeypatch.setenv(_fused_nb.FUSED_NB_ENV_VAR, "0")
+    assert _fused_nb.fused_nb_enabled() is False
     assert fused_nb_status()["requested"] is False
 
 
