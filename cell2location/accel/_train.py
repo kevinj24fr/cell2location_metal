@@ -91,6 +91,29 @@ class AppleSiliconTrainMixin:
     #: inspected afterwards: ``model.numerical_guard_.summary()``.
     numerical_guard_ = None
 
+    def _get_posterior_samples(self, args, kwargs, **sample_kwargs):
+        """Vectorized posterior sampling when it is exactly equivalent; loop otherwise.
+
+        The fast path requires a mean-field AutoNormal guide (site marginals ARE the
+        joint) and a batch covering every observation (a minibatched caller stitches
+        per-batch results, which a full-size draw would break)."""
+        from ._sampling import NotVectorizable, vectorized_posterior_samples
+
+        module = sample_kwargs.get("model") or self.module
+        plain = not sample_kwargs.get("return_observed") and not sample_kwargs.get("exclude_vars")
+        n_obs = getattr(getattr(self, "adata", None), "n_obs", None)
+        full_batch = bool(args) and hasattr(args[0], "shape") and args[0].shape[0] == n_obs
+        if plain and full_batch:
+            try:
+                return vectorized_posterior_samples(
+                    module, args, kwargs,
+                    num_samples=sample_kwargs.get("num_samples", 1000),
+                    return_sites=sample_kwargs.get("return_sites"),
+                )
+            except NotVectorizable as exc:
+                logger.info("Vectorized posterior sampling unavailable (%s); using the looped sampler.", exc)
+        return super()._get_posterior_samples(args, kwargs, **sample_kwargs)
+
     def _prepare_apple_silicon(self, kwargs: dict) -> None:
         _, device = resolve_accelerator(kwargs.get("accelerator", "auto"), kwargs.get("device", "auto"))
         if device.type != "mps":
