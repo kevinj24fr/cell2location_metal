@@ -42,6 +42,18 @@ numerical guard clean, and posterior summaries matching the replaced path within
 Monte-Carlo error. Changes that do not clear the gate do not merge, and are not
 listed.
 
+- **Convergence-based early stopping (Metal runs).** Upstream trains a fixed
+  30,000 epochs with no stopping criterion; the ELBO plateaus long before that and
+  the remainder is a random walk on a flat objective. Training now stops when the
+  best ELBO has not improved by 1e-5 (relative) within 2,000 epochs. Validated by
+  a same-seed 30k-epoch reference comparison at 5,000×10,000 (M2 Ultra): **3.1x
+  wall-clock** (72.6 → 23.5 min), final-ELBO parity, abundance r = 0.990 with
+  every value within 1 posterior standard deviation of the full run (median drift
+  0.34 sd). A ~7x looser setting exists but drifts beyond the posterior's own
+  resolution and is deliberately not the default. Disable with
+  `model.mps_early_stopping = None` or `CELL2LOCATION_MPS_EARLY_STOP=0` to
+  reproduce upstream's fixed-epoch behaviour exactly.
+
 - **Vectorized posterior export.** The looped sampler ran one full guide trace per
   posterior draw — a thousand sequential traces through pyro's effect handlers. For
   the mean-field `AutoNormal` guides both models use by default, the joint

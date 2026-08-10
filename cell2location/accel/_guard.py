@@ -53,6 +53,10 @@ def compare_loss_across_devices(
     Returns ``None`` when the comparison cannot be made (module already on the
     reference device, or an evaluation failed). Otherwise returns both values and
     their relative difference.
+
+    Scope: this validates FORWARD arithmetic only. Gradients of the fused kernel
+    are validated by its own self-test (forward and backward against eager);
+    a wrong backward in any other custom op would not be caught here.
     """
     import pyro
 
@@ -61,6 +65,21 @@ def compare_loss_across_devices(
     original_device = device_of(module)
     if original_device.type == reference_device:
         return None
+
+    # Dropout (module.dropout_p != 0) draws fresh masks per forward; two devices
+    # would disagree on healthy runs. eval() disables it for both evaluations.
+    was_training = getattr(module, "training", False)
+    if was_training:
+        module.eval()
+    try:
+        return _compare_in_eval(module, args, kwargs, reference_device, original_device)
+    finally:
+        if was_training:
+            module.train()
+
+
+def _compare_in_eval(module, args, kwargs, reference_device, original_device):
+    import pyro
 
     try:
         with torch.no_grad():
@@ -217,6 +236,11 @@ class NumericalGuard:
             def on_train_end(self, trainer, pl_module):
                 summary = guard.summary()
                 if summary["checks"] == 0:
+                    logger.warning(
+                        "Numerical guard was armed but completed ZERO checks -- the run is "
+                        "unverified, not verified. Every comparison failed or was skipped; "
+                        "enable debug logging to see why."
+                    )
                     return
                 if summary["diverged"]:
                     logger.warning(

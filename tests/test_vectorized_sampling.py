@@ -69,3 +69,16 @@ def test_return_sites_filters(trained_model):
     out = vectorized_posterior_samples(trained_model.module, args, kwargs, num_samples=4,
                                        return_sites=chosen)
     assert list(out) == chosen
+
+
+def test_fast_and_looped_return_identical_site_sets(trained_model):
+    """Regression pin for a reviewed non-bug: deterministic sites are observed
+    Delta nodes, excluded by BOTH paths under return_observed=False, and
+    return_observed=True already falls back to the loop -- so the default
+    contract's site sets must be identical."""
+    from cell2location.accel import _sampling
+
+    args, kwargs = _batch_args(trained_model)
+    fast = vectorized_posterior_samples(trained_model.module, args, kwargs, num_samples=3)
+    slow = trained_model._get_posterior_samples(args, kwargs, num_samples=3, show_progress=False)
+    assert set(fast) == set(slow)
