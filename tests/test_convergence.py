@@ -62,3 +62,12 @@ def test_missing_metric_is_ignored():
     trainer.callback_metrics = {}
     cb.on_train_epoch_end(trainer, None)  # must not raise
     assert not trainer.should_stop
+
+
+def test_non_finite_losses_neither_stop_nor_become_best():
+    """An inf first loss must not poison _best (every later improvement would look
+    like plateau), and nan must not count toward patience."""
+    cb = RelativeEarlyStopping(rel_tol=1e-4, patience=5, min_epochs=1)
+    losses = [float("inf"), float("nan")] + [1000.0 - i for i in range(20)]
+    assert _run(cb, losses) is None
+    assert cb._best == pytest.approx(981.0)

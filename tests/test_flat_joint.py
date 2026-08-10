@@ -82,3 +82,35 @@ def test_flat_log_joint_is_differentiable(spatial_model):
     value.backward()
     grads = [v.grad for v in latents.values() if v.requires_grad]
     assert grads and all(g is not None and torch.isfinite(g).all() for g in grads)
+
+
+@pytest.mark.parametrize("seed", range(3))
+def test_flat_log_joint_gradients_match_pyro(spatial_model, seed):
+    """Forward equality is not enough for a training engine: a fused backward with
+    recompute-in-backward can be wrong while the forward matches. Per-latent
+    gradients must equal pyro's autograd through the replayed trace."""
+    import pyro
+
+    args, kwargs = _batch(spatial_model)
+    torch.manual_seed(seed)
+    latents = flat.sample_latents_from_guide(spatial_model.module, args, kwargs, requires_grad=True)
+
+    flat_value = flat.flat_log_joint(spatial_model.module, args, kwargs, latents)
+    names = [n for n, v in latents.items() if v.requires_grad]
+    tensors = [latents[n] for n in names]
+    flat_grads = torch.autograd.grad(flat_value, tensors, retain_graph=False, allow_unused=True)
+
+    trace = _sample_values_to_from_dict(latents)
+    replayed = pyro.poutine.trace(pyro.poutine.replay(spatial_model.module.model, trace=trace)).get_trace(
+        *args, **kwargs
+    )
+    pyro_grads = torch.autograd.grad(replayed.log_prob_sum(), tensors, allow_unused=True)
+
+    for name, fg, pg in zip(names, flat_grads, pyro_grads):
+        if fg is None and pg is None:
+            continue
+        assert fg is not None and pg is not None, name
+        scale = pg.abs().max().clamp_min(1e-6)
+        assert (fg - pg).abs().max() <= 1e-4 * scale, (
+            f"{name}: max grad diff {(fg - pg).abs().max():.3e} vs scale {scale:.3e}"
+        )

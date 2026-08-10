@@ -32,10 +32,16 @@ class RelativeEarlyStopping:
         self.stopped_epoch = None
 
     def on_train_epoch_end(self, trainer, pl_module):
+        import math
+
         metric = trainer.callback_metrics.get(self.monitor)
         if metric is None:
             return
         loss = float(metric)
+        if not math.isfinite(loss):
+            # A non-finite loss must neither become the best (inf would make every
+            # later improvement invisible) nor count toward the plateau.
+            return
 
         if self._best is None or self._best - loss > self.rel_tol * abs(self._best):
             self._best = loss
