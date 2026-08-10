@@ -1,3 +1,4 @@
+import logging
 from typing import List, Optional, Union
 
 import matplotlib.pyplot as plt
@@ -24,6 +25,11 @@ from scvi.model.base._pyromixin import PyroJitGuideWarmup
 from scvi.train import TrainRunner
 from scvi.utils import setup_anndata_dsp
 
+from cell2location.accel import (
+    AppleSiliconTrainMixin,
+    compile_is_safe,
+    resolve_accelerator,
+)
 from cell2location.models._cell2location_module import (
     LocationModelLinearDependentWMultiExperimentLocationBackgroundNormLevelGeneAlphaPyroModel,
 )
@@ -36,8 +42,12 @@ from cell2location.models.base._pyro_mixin import (
 )
 from cell2location.utils import select_slide
 
+logger = logging.getLogger(__name__)
 
-class Cell2location(QuantileMixin, PyroSampleMixin, PyroSviTrainMixin, PltExportMixin, BaseModelClass):
+
+class Cell2location(
+    AppleSiliconTrainMixin, QuantileMixin, PyroSampleMixin, PyroSviTrainMixin, PltExportMixin, BaseModelClass
+):
     r"""
     Cell2location model. User-end model class. See Module class for description of the model (incl. math).
 
@@ -161,10 +171,33 @@ class Cell2location(QuantileMixin, PyroSampleMixin, PyroSviTrainMixin, PltExport
         adata_manager.register_fields(adata, **kwargs)
         cls.register_manager(adata_manager)
 
-    def train_compiled(self, compile_mode=None, compile_dynamic=None, **kwargs):
+    def train_compiled(self, compile_mode=None, compile_dynamic=None, compile_backend=None, **kwargs):
+        """Train with ``torch.compile`` applied to the model and guide.
+
+        On Apple silicon this degrades to eager execution unless
+        ``CELL2LOCATION_ALLOW_MPS_COMPILE=1`` is set. TorchInductor's Metal path is
+        much younger than its CUDA path, and the graphs Pyro emits -- dynamic plate
+        sizes, effectful sample sites, control flow inside the guide -- are the ones
+        most likely to break it. Silently training 30k steps on a miscompiled graph
+        is a worse outcome than not compiling.
+        """
+        _, device = resolve_accelerator(kwargs.get("accelerator", "auto"), kwargs.get("device", "auto"))
+
         self.train(**kwargs, max_steps=1)
-        self.module._model = torch.compile(self.module.model, mode=compile_mode, dynamic=compile_dynamic)
-        self.module._guide = torch.compile(self.module.guide, mode=compile_mode, dynamic=compile_dynamic)
+
+        if not compile_is_safe(device):
+            logger.warning(
+                "torch.compile is not enabled on the Metal backend by default; continuing in eager mode. "
+                "Set CELL2LOCATION_ALLOW_MPS_COMPILE=1 to override."
+            )
+            self.train(**kwargs)
+            return
+
+        compile_kwargs = dict(mode=compile_mode, dynamic=compile_dynamic)
+        if compile_backend is not None:
+            compile_kwargs["backend"] = compile_backend
+        self.module._model = torch.compile(self.module.model, **compile_kwargs)
+        self.module._guide = torch.compile(self.module.guide, **compile_kwargs)
         self.train(**kwargs)
 
     def train(
@@ -212,6 +245,8 @@ class Cell2location(QuantileMixin, PyroSampleMixin, PyroSviTrainMixin, PltExport
             if scale_elbo is None:
                 scale_elbo = 1.0 / (self.summary_stats["n_cells"] * self.summary_stats["n_vars"])
             kwargs["plan_kwargs"]["scale_elbo"] = scale_elbo
+
+        self._prepare_apple_silicon(kwargs)
 
         super().train(**kwargs)
 

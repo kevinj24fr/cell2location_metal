@@ -17,13 +17,16 @@ from scvi.data.fields import (
 from scvi.model.base import BaseModelClass, PyroSampleMixin, PyroSviTrainMixin
 from scvi.utils import setup_anndata_dsp
 
+from ...accel import AppleSiliconTrainMixin
 from ...cluster_averages import compute_cluster_averages
 from ..base._pyro_base_reference_module import RegressionBaseModule
 from ..base._pyro_mixin import PltExportMixin, QuantileMixin
 from ._reference_module import RegressionBackgroundDetectionTechPyroModel
 
 
-class RegressionModel(QuantileMixin, PyroSampleMixin, PyroSviTrainMixin, PltExportMixin, BaseModelClass):
+class RegressionModel(
+    AppleSiliconTrainMixin, QuantileMixin, PyroSampleMixin, PyroSviTrainMixin, PltExportMixin, BaseModelClass
+):
     """
     Model which estimates per cluster average mRNA count account for batch effects. User-end model class.
 
@@ -153,6 +156,8 @@ class RegressionModel(QuantileMixin, PyroSampleMixin, PyroSviTrainMixin, PltExpo
         kwargs["batch_size"] = batch_size
         kwargs["train_size"] = train_size
         kwargs["lr"] = lr
+
+        self._prepare_apple_silicon(kwargs)
 
         super().train(**kwargs)
 

@@ -69,6 +69,46 @@ export PYTHONNOUSERSITE="literallyanyletters"
 ```
 
 
+## Apple silicon (Metal / MPS)
+
+This fork adds first-class support for training on the Apple silicon GPU via the Metal
+(MPS) backend.
+
+```python
+import cell2location
+from cell2location.accel import configure, prepare_anndata
+
+configure()                 # allocator watermarks + backend check
+prepare_anndata(adata)      # float64 counts -> float32, once
+
+model.train(max_epochs=30000, accelerator="mps")
+```
+
+Verify your machine before trusting a run — the failure mode worth caring about is a
+silently wrong `lgamma`, not a crash:
+
+```bash
+python benchmarks/apple_silicon_check.py
+```
+
+A note on the Neural Engine: it cannot train this model. The ANE is reachable only
+through CoreML, which has no autograd, no optimiser state and no sampling statements,
+while cell2location trains by variational inference over a Pyro graph that needs all
+three. Training runs on the GPU. The ANE can optionally run the amortised guide's
+encoder network at inference time, which is worthwhile when scoring many slides against
+an already-trained model.
+
+Two further things worth knowing:
+
+- **Verify while you train.** `CELL2LOCATION_MPS_GUARD=1` cross-checks the loss against
+  the CPU every 1000 steps, so silent divergence is caught on your data rather than on
+  synthetic shapes.
+- **Unified memory changes what fits.** `cell2location.accel.plan_memory(adata)` tells
+  you whether your dataset trains full-batch on this machine — which, on a large-memory
+  Mac, it often does at scales a discrete GPU cannot reach.
+
+Full details, escape hatches and known limits: [docs/apple_silicon.md](docs/apple_silicon.md).
+
 ## Documentation and API details
 
 User documentation is availlable on https://cell2location.readthedocs.io/en/latest/. 

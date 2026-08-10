@@ -6,7 +6,7 @@ from rich.console import Console
 from rich.logging import RichHandler
 from torch.distributions import biject_to, transform_to
 
-from . import models
+from . import accel, models
 from .cell_comm.around_target import compute_weighted_average_around_target
 from .run_colocation import run_colocation
 
@@ -45,6 +45,7 @@ logger.addHandler(ch)
 logger.propagate = False
 
 __all__ = [
+    "accel",
     "models",
     "run_colocation",
     "compute_weighted_average_around_target",

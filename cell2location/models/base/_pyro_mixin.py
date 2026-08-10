@@ -17,10 +17,11 @@ from pyro.infer.autoguide import AutoNormal, init_to_feasible, init_to_mean
 from scipy.sparse import issparse
 from scvi import REGISTRY_KEYS
 from scvi.dataloaders import AnnDataLoader
-from scvi.model._utils import parse_device_args
 from scvi.module.base import PyroBaseModuleClass
 from scvi.train import PyroTrainingPlan as PyroTrainingPlan_scvi
 
+from ...accel import parse_device_args_safe as parse_device_args
+from ...accel import sanitize_args
 from ...distributions.AutoAmortisedNormalMessenger import (
     AutoAmortisedHierarchicalNormalMessenger,
 )
@@ -234,8 +235,7 @@ class QuantileMixin:
         i = 0
         for tensor_dict in train_dl:
             args, kwargs = self.module._get_fn_args_from_batch(tensor_dict)
-            args = [a.to(device) for a in args]
-            kwargs = {k: v.to(device) for k, v in kwargs.items()}
+            args, kwargs = sanitize_args(args, kwargs, device)
             self.to_device(device)
 
             if i == 0:
@@ -272,8 +272,7 @@ class QuantileMixin:
         # sample global parameters
         tensor_dict = next(iter(train_dl))
         args, kwargs = self.module._get_fn_args_from_batch(tensor_dict)
-        args = [a.to(device) for a in args]
-        kwargs = {k: v.to(device) for k, v in kwargs.items()}
+        args, kwargs = sanitize_args(args, kwargs, device)
         self.to_device(device)
 
         if use_median and q == 0.5:
@@ -341,8 +340,7 @@ class QuantileMixin:
         # sample global parameters
         tensor_dict = next(iter(train_dl))
         args, kwargs = self.module._get_fn_args_from_batch(tensor_dict)
-        args = [a.to(device) for a in args]
-        kwargs = {k: v.to(device) for k, v in kwargs.items()}
+        args, kwargs = sanitize_args(args, kwargs, device)
         self.to_device(device)
 
         if use_median and q == 0.5:

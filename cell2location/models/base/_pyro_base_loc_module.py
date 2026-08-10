@@ -3,10 +3,11 @@ from typing import Literal, Optional
 from pyro.infer.autoguide import init_to_mean
 from scvi.module.base import PyroBaseModuleClass
 
+from ...accel import AppleSiliconCompatMixin
 from ._pyro_mixin import AutoGuideMixinModule, init_to_value
 
 
-class Cell2locationBaseModule(PyroBaseModuleClass, AutoGuideMixinModule):
+class Cell2locationBaseModule(AppleSiliconCompatMixin, PyroBaseModuleClass, AutoGuideMixinModule):
     r"""
     Module class which defines AutoGuide given model. Supports multiple model architectures.
 

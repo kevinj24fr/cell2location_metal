@@ -45,6 +45,12 @@ Additionally we provide 2 models for downstream analysis of cell abundance estim
    dockersingularity
 
 .. toctree::
+   :maxdepth: 2
+   :caption: Apple silicon:
+
+   apple_silicon
+
+.. toctree::
    :maxdepth: 4
    :caption: API:
 

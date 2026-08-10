@@ -6,6 +6,9 @@ from pyro.distributions import Gamma, Poisson
 from torch.distributions import Distribution, constraints
 from torch.distributions.utils import broadcast_all, probs_to_logits
 
+from ..accel import log_nb_positive as _log_nb_positive_guarded
+from ..accel import run_on_cpu, supports_op
+
 # NB distribution parameterisation with mu and theta parametrisation is copied over from scVI:
 #    Copyright (c) 2020 Romain Lopez, Adam Gayoso, Galen Xing, Yosef Lab
 #    All rights reserved
@@ -21,21 +24,13 @@ def log_nb_positive(value, mu, theta, eps=1e-8):
     mu: mean of the negative binomial (has to be positive support) (shape: minibatch x genes)
     theta: inverse dispersion parameter (has to be positive support) (shape: minibatch x genes)
     eps: numerical stability constant
+
+    Delegates to :func:`cell2location.accel.log_nb_positive`. That implementation is
+    arithmetically identical but never hands a stride-0 broadcast view to ``lgamma``,
+    which is what makes the likelihood trustworthy on the Metal backend. On CPU and
+    CUDA the two compute exactly the same thing.
     """
-    if theta.ndimension() == 1:
-        theta = theta.view(1, theta.size(0))  # In this case, we reshape theta for broadcasting
-
-    log_theta_mu_eps = torch.log(theta + mu + eps)
-
-    res = (
-        theta * (torch.log(theta + eps) - log_theta_mu_eps)
-        + value * (torch.log(mu + eps) - log_theta_mu_eps)
-        + torch.lgamma(value + theta)
-        - torch.lgamma(theta)
-        - torch.lgamma(value + 1)
-    )
-
-    return res
+    return _log_nb_positive_guarded(value, mu=mu, theta=theta, eps=eps)
 
 
 def log_nb_pymc3(value, mu, alpha, eps=1e-8):
@@ -104,6 +99,7 @@ class NegativeBinomial(Distribution):
     one parameterization to another.
 
     """
+
     arg_constraints = {
         "mu": constraints.greater_than_eq(0),
         "theta": constraints.greater_than_eq(0),
@@ -138,7 +134,16 @@ class NegativeBinomial(Distribution):
         super().__init__(validate_args=validate_args)
 
     def sample(self, sample_shape=torch.Size()):
-        gamma_d = self._gamma()
+        # The Gamma-Poisson compound needs ``_standard_gamma`` and ``poisson``, neither
+        # of which the Metal backend has historically implemented. Probe rather than
+        # hard-code, so a PyTorch release that adds them is picked up automatically.
+        if self.mu.device.type == "mps" and not (supports_op("standard_gamma") and supports_op("poisson")):
+            return run_on_cpu(self._sample_impl, self.mu, self.theta, sample_shape=sample_shape)
+        return self._sample_impl(self.mu, self.theta, sample_shape=sample_shape)
+
+    @staticmethod
+    def _sample_impl(mu, theta, sample_shape=torch.Size()):
+        gamma_d = Gamma(concentration=theta, rate=theta / mu)
         p_means = gamma_d.sample(sample_shape)
 
         # Clamping as distributions objects can have buggy behaviors when

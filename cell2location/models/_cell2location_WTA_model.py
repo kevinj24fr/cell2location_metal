@@ -24,6 +24,7 @@ from scvi.model.base._pyromixin import PyroJitGuideWarmup
 from scvi.train import TrainRunner
 from scvi.utils import setup_anndata_dsp
 
+from cell2location.accel import AppleSiliconTrainMixin
 from cell2location.models._cell2location_WTA_module import (
     LocationModelWTAMultiExperimentHierarchicalGeneLevel,
 )
@@ -37,7 +38,9 @@ from cell2location.models.base._pyro_mixin import (
 from cell2location.utils import select_slide
 
 
-class Cell2location_WTA(QuantileMixin, PyroSampleMixin, PyroSviTrainMixin, PltExportMixin, BaseModelClass):
+class Cell2location_WTA(
+    AppleSiliconTrainMixin, QuantileMixin, PyroSampleMixin, PyroSviTrainMixin, PltExportMixin, BaseModelClass
+):
     r"""
     Cell2location model. User-end model class. See Module class for description of the model (incl. math).
 
@@ -211,6 +214,8 @@ class Cell2location_WTA(QuantileMixin, PyroSampleMixin, PyroSviTrainMixin, PltEx
             if scale_elbo is None:
                 scale_elbo = 1.0 / (self.summary_stats["n_cells"] * self.summary_stats["n_genes"])
             kwargs["plan_kwargs"]["scale_elbo"] = scale_elbo
+
+        self._prepare_apple_silicon(kwargs)
 
         super().train(**kwargs)
 
