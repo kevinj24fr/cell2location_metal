@@ -1,0 +1,13 @@
+{
+  "train_ms_per_epoch": 274.89432639752823,
+  "final_elbo": 210144960.0,
+  "guard": {
+    "checks": 3,
+    "diverged": false,
+    "max_relative_difference": 1.5301339609330788e-07,
+    "mean_relative_difference": 1.2684130973766644e-07,
+    "tolerance": 0.001
+  },
+  "export_seconds": 181.22907995805144,
+  "export_parity_median_rel": {}
+}

@@ -34,6 +34,25 @@ pip install git+https://github.com/kevinj24fr/cell2location_metal.git
 Details, escape hatches, and known limits: [docs/apple_silicon.md](docs/apple_silicon.md).
 Everything below describes the cell2location method itself, unchanged from upstream.
 
+## Engine changelog (validated)
+
+Every entry here cleared the push gate in `benchmarks/engine_validation.py` before
+merging: measurably faster than what it replaced, final-ELBO parity within 0.5%,
+numerical guard clean, and posterior summaries matching the replaced path within
+Monte-Carlo error. Changes that do not clear the gate do not merge, and are not
+listed.
+
+- **Vectorized posterior export.** The looped sampler ran one full guide trace per
+  posterior draw — a thousand sequential traces through pyro's effect handlers. For
+  the mean-field `AutoNormal` guides both models use by default, the joint
+  factorizes over sites, so all draws are one batched
+  `transform(loc + scale · eps)` per site: the same distribution, shaped as a
+  batch. Falls back to the loop for non-mean-field guides, minibatched export, or
+  observed-site sampling. Validation harness at 5,000 locations × 10,000 genes,
+  1,000 samples, M2 Ultra: export 181.2s → 11.1s (**16.3x**); summary parity vs
+  the loop within Monte-Carlo error (means 0.3%, quantiles 0.6% median relative);
+  final-ELBO parity and numerical guard clean (worst CPU/GPU difference 1.5e-7).
+
 ---
 
 ### About cell2location
