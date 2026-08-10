@@ -12,9 +12,18 @@ Scope (matches the contract fixture): full-batch evaluation (obs-plate scale 1),
 initial-value observation branches are deliberately out of scope until needed.
 """
 
+import math
+
 import torch
 
-__all__ = ["sample_latents_from_guide", "flat_log_joint"]
+__all__ = [
+    "sample_latents_from_guide",
+    "flat_log_joint",
+    "sample_unconstrained_from_guide",
+    "constrain_latents",
+    "flat_log_q",
+    "flat_elbo",
+]
 
 
 def _gamma_lp(x, concentration, rate):
@@ -52,6 +61,51 @@ def sample_latents_from_guide(module, args, kwargs, requires_grad: bool = False)
             value = transform(loc + scale * eps)
             latents[name] = value.detach().clone().requires_grad_(requires_grad)
     return latents
+
+
+def sample_unconstrained_from_guide(module, requires_grad: bool = False):
+    """One unconstrained draw u = loc + scale*eps per guide site, as leaf tensors."""
+    from ._sampling import _autonormal_site_params
+
+    unconstrained = {}
+    with torch.no_grad():
+        for name, loc, scale, _transform in _autonormal_site_params(module.guide):
+            eps = torch.randn(loc.shape, device=loc.device, dtype=loc.dtype)
+            u = loc + scale * eps
+            unconstrained[name] = u.detach().clone().requires_grad_(requires_grad)
+    return unconstrained
+
+
+def constrain_latents(module, unconstrained):
+    """Constrained latents z = transform(u), graph intact for autograd."""
+    from ._sampling import _autonormal_site_params
+
+    return {
+        name: transform(unconstrained[name])
+        for name, _loc, _scale, transform in _autonormal_site_params(module.guide)
+    }
+
+
+def flat_log_q(module, unconstrained):
+    """log q(z) of the mean-field guide at the draw, from u directly (no inverses):
+    sum over sites of Normal(loc, scale).log_prob(u) - log|det J_transform(u)|."""
+    from ._sampling import _autonormal_site_params
+
+    log_q = None
+    for name, loc, scale, transform in _autonormal_site_params(module.guide):
+        u = unconstrained[name]
+        normal_lp = (
+            -0.5 * ((u - loc) / scale).pow(2) - torch.log(scale) - 0.5 * math.log(2.0 * math.pi)
+        ).sum()
+        term = normal_lp - transform.log_abs_det_jacobian(u, transform(u)).sum()
+        log_q = term if log_q is None else log_q + term
+    return log_q
+
+
+def flat_elbo(module, args, kwargs, unconstrained):
+    """Single-particle ELBO estimate at the draw: flat_log_joint - flat_log_q."""
+    latents = constrain_latents(module, unconstrained)
+    return flat_log_joint(module, args, kwargs, latents) - flat_log_q(module, unconstrained)
 
 
 def flat_log_joint(module, args, kwargs, latents):
