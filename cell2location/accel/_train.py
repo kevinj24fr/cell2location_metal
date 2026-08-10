@@ -94,9 +94,13 @@ class AppleSiliconTrainMixin:
 
     #: Convergence-based early stopping for Metal runs: stop when the best ELBO has
     #: not improved by rel_tol (relative) within patience epochs, never before
-    #: min_epochs. Upstream's fixed 30k epochs keeps training long after the
-    #: plateau. Set to None (or CELL2LOCATION_MPS_EARLY_STOP=0) to disable.
-    mps_early_stopping: dict = {"rel_tol": 1e-4, "patience": 500, "min_epochs": 1000}
+    #: min_epochs. Defaults are the validated "tight" operating point (3.1x over
+    #: upstream's fixed 30k epochs; every abundance within 1 posterior sd of the
+    #: full run, r=0.990). A looser point ({"rel_tol": 1e-4, "patience": 500,
+    #: "min_epochs": 1000}) reaches ~7x but drifts beyond the posterior's own
+    #: resolution and is deliberately not the default. Set to None (or
+    #: CELL2LOCATION_MPS_EARLY_STOP=0) to reproduce upstream exactly.
+    mps_early_stopping: dict = {"rel_tol": 1e-5, "patience": 2000, "min_epochs": 2000}
 
     #: Populated when early stopping is active; ``model.early_stopping_.stopped_epoch``
     #: records where (None if the run reached max_epochs).
