@@ -1,17 +1,46 @@
-<p align="center">
-   <img src="https://github.com/BayraktarLab/cell2location/blob/master/docs/logo.svg?raw=True" width="200">
-</p>
+# cell2location_metal
 
-### Comprehensive mapping of tissue cell architecture via integrated single cell and spatial transcriptomics (cell2location model)
+**cell2location with first-class Apple silicon support.** A fork of
+[BayraktarLab/cell2location](https://github.com/BayraktarLab/cell2location) that makes
+the full workflow — reference signatures, spatial mapping, posterior export — run
+fast, correctly, and with zero configuration on the Metal (MPS) backend, while
+staying behaviourally identical to upstream on CPU and CUDA.
 
-[![Stars](https://img.shields.io/github/stars/BayraktarLab/cell2location?logo=GitHub&color=yellow)](https://github.com/BayraktarLab/cell2location/stargazers)
-![Build Status](https://github.com/BayraktarLab/cell2location/actions/workflows/test.yml/badge.svg?event=push)
-[![Documentation Status](https://readthedocs.org/projects/cell2location/badge/?version=latest)](https://cell2location.readthedocs.io/en/stable/?badge=latest)
-[![Downloads](https://pepy.tech/badge/cell2location)](https://pepy.tech/project/cell2location)
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/BayraktarLab/cell2location/blob/master/docs/notebooks/cell2location_tutorial.ipynb)
-[![Docker image on quay.io](https://img.shields.io/badge/container-quay.io/vitkl/cell2location-brightgreen "Docker image on quay.io")](https://quay.io/vitkl/cell2location) 
+**What this fork adds:**
 
-If you use cell2location please cite our paper: 
+- **Zero-config Metal training.** `model.train()` picks the GPU, converts dtypes in
+  place, keeps the full batch device-resident, and routes the negative-binomial
+  likelihood through a fused Metal kernel that verifies itself against the eager
+  implementation (forward *and* gradients) before it is allowed to run.
+- **A numerical guard.** During training, the model log-joint is periodically
+  recomputed on the CPU under the same sampled latents and compared. Silent GPU
+  divergence — the failure mode that matters — is caught on your data, during your
+  run, not on synthetic shapes.
+- **`torch.compile` on Metal.** `train_compiled()` works (torch ≥ 2.12) and arms the
+  guard automatically.
+- **Measured on an M2 Ultra** (5,000 locations × 10,000 genes, full batch):
+  CPU 742 ms/epoch → Metal 140 ms/epoch out of the box (5.2x) → ~114 ms/epoch
+  compiled (6.5x), with guard-verified CPU/GPU agreement at 2×10⁻⁷ relative.
+- **Verified against upstream's own test suite** (109 passed) plus ~100 fork tests
+  covering the Metal layer, and a benchmark/parity harness
+  (`benchmarks/apple_silicon_check.py`) that produces a shareable HTML report.
+
+**Install this fork:**
+
+```bash
+pip install git+https://github.com/kevinj24fr/cell2location_metal.git
+```
+
+Details, escape hatches, and known limits: [docs/apple_silicon.md](docs/apple_silicon.md).
+Everything below describes the cell2location method itself, unchanged from upstream.
+
+---
+
+### About cell2location
+
+Comprehensive mapping of tissue cell architecture via integrated single cell and
+spatial transcriptomics. All scientific credit belongs to the original authors —
+if you use cell2location (through this fork or otherwise) please cite:
 
 Kleshchevnikov, V., Shmatko, A., Dann, E. et al. Cell2location maps fine-grained cell types in spatial transcriptomics. Nat Biotechnol (2022). https://doi.org/10.1038/s41587-021-01139-4
 https://www.nature.com/articles/s41587-021-01139-4
@@ -43,7 +72,7 @@ Create conda environment and install `cell2location` package
 conda create -y -n cell2loc_env python=3.10
 
 conda activate cell2loc_env
-pip install cell2location[tutorials]
+pip install "cell2location[tutorials] @ git+https://github.com/kevinj24fr/cell2location_metal.git"
 ```
 
 Finally, to use this environment in jupyter notebook, add jupyter kernel for this environment:
@@ -71,23 +100,13 @@ export PYTHONNOUSERSITE="literallyanyletters"
 
 ## Apple silicon (Metal / MPS)
 
-This fork adds first-class support for training on the Apple silicon GPU via the Metal
-(MPS) backend. It is zero-config: on a Mac, the standard cell2location workflow picks
-the GPU, converts dtypes, keeps the full batch device-resident, and routes the
-likelihood through a fused Metal kernel that verifies itself against the eager
-implementation before it is allowed to run. There is nothing to import and nothing
-to enable:
+The Metal support summarized at the top of this README is zero-config:
 
 ```python
 model.train()                      # accelerator="auto" picks Metal on a Mac
 model.train_compiled()             # adds torch.compile; the numerical guard
                                    # cross-checks the loss against CPU as it trains
 ```
-
-Measured on an M2 Ultra (5,000 locations x 10,000 genes, full batch, torch 2.12):
-CPU 742 ms/epoch; Metal 140 ms/epoch out of the box; ~114 ms/epoch with
-`train_compiled()` — with the model log-joint agreeing with CPU to ~2e-7 relative
-under the guard's replay comparison.
 
 Verify your machine before trusting a run — the failure mode worth caring about is a
 silently wrong `lgamma`, not a crash:
