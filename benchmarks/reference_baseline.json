@@ -1,0 +1,18 @@
+{
+  "train_ms_per_epoch": 569.647793037196,
+  "final_elbo": 395172832.0,
+  "guard": {
+    "checks": 12,
+    "diverged": false,
+    "max_relative_difference": 1.5834517887225612e-07,
+    "mean_relative_difference": 7.200159985089269e-08,
+    "tolerance": 0.001
+  },
+  "flat_engine_used": false,
+  "config": {
+    "n_obs": 10000,
+    "n_genes": 10000,
+    "epochs": 30,
+    "batch_size": 2500
+  }
+}
