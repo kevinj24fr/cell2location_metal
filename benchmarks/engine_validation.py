@@ -31,7 +31,11 @@ import time
 from pathlib import Path
 
 import numpy as np
-import torch
+
+sys.path.insert(0, str(Path(__file__).parent))
+from _gate import (  # noqa: E402
+    QUIET, REPEATS, quiet_libraries, repeat_runs, verdict,
+)
 
 # ``--minibatch`` gates the spatial model's MINIBATCH configuration, which is a
 # different engine path with different performance characteristics, so it keeps
@@ -45,38 +49,14 @@ BASELINE = Path(__file__).parent / (
 )
 N_OBS, N_GENES, EPOCHS = 5000, 10000, 30
 
-# Reported timing is the MINIMUM of REPEATS runs after WARMUP_RUNS discarded
-# ones, not the median. Contention can only ADD time to a run, so under load the
-# minimum is the best available estimate of the uncontended cost while the median
-# tracks whatever else the machine is doing: measured on a loaded machine, this
-# workload's runs spread 32.0 / 67.4 / 68.6 while its minimum stayed within 1 ms
-# of a quiet-machine capture. All runs are recorded so the spread stays visible.
-WARMUP_RUNS, REPEATS = 1, 3
 
-# A no-regression check has to be looser than the instrument can resolve, or it
-# fires on noise. Measured across independent captures of IDENTICAL master code:
-# export minima 10.49 / 10.64 / 11.06 s (5.4% apart) and within-capture spreads
-# of 1.7-3.8%. A 1.05 tolerance sat inside that and failed a change that does not
-# touch export at all. This is calibrated to the measurement, not to any
-# particular change -- a real regression is a factor, not a few percent; the
-# improvement gate below is what demands actual evidence.
-NO_REGRESSION_TOLERANCE = 1.15
 
 
 def build():
-    import logging
-
-    for name in ("lightning.pytorch", "pytorch_lightning"):
-        logging.getLogger(name).setLevel(logging.ERROR)
-    import pyro
+    import torch
     from scvi.data import synthetic_iid
 
-    # pyro's parameter store is process-global. Repeated runs in one process
-    # otherwise let a previous model's guide parameters -- still on the previous
-    # run's device -- be picked up by the next, which surfaces as a mid-forward
-    # "found at least two devices" error rather than as anything resembling its
-    # cause. Each run has to start from an empty store to be independent.
-    pyro.clear_param_store()
+    quiet_libraries()
 
     import cell2location.accel as accel
     from cell2location.models import Cell2location, RegressionModel
@@ -92,9 +72,6 @@ def build():
     Cell2location.setup_anndata(adata, batch_key="batch")
     model = Cell2location(adata, cell_state_df=cell_state_df, N_cells_per_location=8, detection_alpha=20)
     return model, adata
-
-
-QUIET = {"enable_progress_bar": False, "enable_model_summary": False}
 
 
 def _train_kwargs():
@@ -120,11 +97,10 @@ def _guard_run():
 def _timed_run():
     """One build + train + fast export, guard OFF. Returns its metrics and its
     model/adata, so parity can be run against the reported run specifically."""
-    quiet = QUIET
     model, adata = build()
 
     t0 = time.perf_counter()
-    model.train(max_epochs=EPOCHS, accelerator="mps", **_train_kwargs(), **quiet)
+    model.train(max_epochs=EPOCHS, accelerator="mps", **_train_kwargs(), **QUIET)
     train_ms = (time.perf_counter() - t0) / EPOCHS * 1000
     elbo = float(np.asarray(model.history_["elbo_train"]).ravel()[-1])
 
@@ -176,37 +152,14 @@ def _parity(model, adata, fast):
 
 
 def main():
-    # Timing this workload needed two corrections, both found by watching the
-    # per-run numbers rather than the median:
-    #   * Holding every repeat's model alive at once (three 5,000x10,000 datasets
-    #     plus posterior samples) made each run slower than the last
-    #     (73.8 -> 80.1 -> 91.5). The harness was measuring its own footprint.
-    #     Only the last run's model is kept now; the rest are freed.
-    #   * With that fixed the order reversed (95.8 -> 81.1 -> 73.2): the first
-    #     run pays warmup. It is now run and discarded.
-    # Runs are seeded identically and produce bit-identical ELBO and guard
-    # values, so the kept run's numbers describe them all; only timing varies.
-    import gc
-
-    timings, kept = [], None
-    total = WARMUP_RUNS + REPEATS
-    for i in range(total):
-        if kept is not None:
-            del kept
-            gc.collect()
-            torch.mps.empty_cache()
-            kept = None
-        result = _timed_run()
-        if i >= WARMUP_RUNS:
-            timings.append(result[0])
-        if i == total - 1:
-            kept = result
-
+    # Runs are seeded identically and produce bit-identical ELBO, guard and
+    # parity values, so the kept run's numbers describe them all; only timing
+    # varies. See _gate.repeat_runs for why earlier runs are freed as they go.
+    timings, kept = repeat_runs(_timed_run, keep_last=True)
     metrics, model, adata, fast = kept
     metrics = dict(metrics)
     metrics["train_ms_per_epoch"] = min(t["train_ms_per_epoch"] for t in timings)
     metrics["export_seconds"] = min(t["export_seconds"] for t in timings)
-    runs = [(t,) for t in timings]
     key = next(k for k in fast if k.startswith("means"))
 
     # Parity first: it exports from the kept model, whose guide parameters live
@@ -214,49 +167,24 @@ def main():
     # store, which would pull the kept model's parameters out from under it.
     metrics["export_parity_median_rel"] = _parity(model, adata, fast)
     metrics["guard"] = _guard_run()
-    metrics["train_ms_all_runs"] = [round(r[0]["train_ms_per_epoch"], 1) for r in runs]
-    metrics["export_seconds_all_runs"] = [round(r[0]["export_seconds"], 2) for r in runs]
+    metrics["train_ms_all_runs"] = [round(t["train_ms_per_epoch"], 1) for t in timings]
+    metrics["export_seconds_all_runs"] = [round(t["export_seconds"], 2) for t in timings]
     metrics["repeats"] = REPEATS
     metrics["minibatch"] = BATCH_SIZE if MINIBATCH else None
-    print(json.dumps(metrics, indent=2, default=str))
-    parity = metrics["export_parity_median_rel"]
-    train_ms = metrics["train_ms_per_epoch"]
-    elbo = metrics["final_elbo"]
-    guard = metrics["guard"]
-    export_s = metrics["export_seconds"]
 
-    if not BASELINE.exists():
-        BASELINE.write_text(json.dumps(metrics, indent=2, default=str))
-        print("No baseline existed; wrote this run AS the baseline (run on master!). "
-              "Gates not evaluated.")
-        return 2
-
-    base = json.loads(BASELINE.read_text())
-    no_regression_only = "--no-regression" in sys.argv
-
-    train_ratio = train_ms / base["train_ms_per_epoch"]
-    export_ratio = export_s / base["export_seconds"]
-    checks = {
-        "train_no_regression": train_ratio <= NO_REGRESSION_TOLERANCE,
-        "export_no_regression": export_ratio <= NO_REGRESSION_TOLERANCE,
-        "elbo_parity": abs(elbo - base["final_elbo"]) / abs(base["final_elbo"]) <= 0.005,
+    base_exists = BASELINE.exists()
+    base = json.loads(BASELINE.read_text()) if base_exists else {}
+    guard, parity = metrics["guard"], metrics["export_parity_median_rel"]
+    extra = {} if not base_exists else {
+        "elbo_parity": abs(metrics["final_elbo"] - base["final_elbo"]) / abs(base["final_elbo"]) <= 0.005,
         "guard_clean": guard.get("checks", 0) > 0 and not guard.get("diverged", True)
                        and np.isfinite(guard.get("max_relative_difference", np.inf)),
         "export_means_parity": parity.get(key, 1.0) <= 0.02,
         "export_quantile_parity": all(v <= 0.03 for kk, v in parity.items() if kk.startswith("q")),
     }
-    if not no_regression_only:
-        # An engine change aimed at this arm must actually pay somewhere.
-        checks["something_got_faster"] = min(train_ratio, export_ratio) <= 0.95
-    print(f"  train {train_ratio:.3f}x baseline, export {export_ratio:.3f}x baseline"
-          f"{'  [no-regression mode]' if no_regression_only else ''}")
-    for name, ok in checks.items():
-        print(f"  {'ok  ' if ok else 'FAIL'} {name}")
-    if all(checks.values()):
-        print("ALL GATES PASS -- pushable.")
-        return 0
-    print("GATES FAILED -- do not push.")
-    return 1
+    return verdict(metrics, BASELINE, extra,
+                   {"train": "train_ms_per_epoch", "export": "export_seconds"},
+                   "--no-regression" in sys.argv)
 
 
 if __name__ == "__main__":

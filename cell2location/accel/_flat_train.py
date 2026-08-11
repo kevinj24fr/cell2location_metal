@@ -1,4 +1,4 @@
-"""The flat training engine (task #13): pyro-free full-batch SVI on two flat tensors.
+"""The flat training engine: pyro-free SVI on two flat tensors.
 
 Every guide parameter lives in two flat leaves -- unconstrained loc and
 softplus-unconstrained rho, matching AutoNormal's SoftplusPositive scale
@@ -16,11 +16,17 @@ Do not reintroduce clipping without a trajectory-validation artifact. The
 correctness chain to pyro is tests/test_flat_train.py -> test_flat_elbo.py ->
 test_flat_joint.py.
 
-Scope matches the flat log-joint: full batch, no dropout, no initial-value
-branches, single particle, unscaled ELBO. The caller falls back to the pyro
-path whenever any of that fails to hold; the guide is only written to after a
-finite run, so a diverged flat run leaves the model exactly as the pyro path
-would find it.
+Both full-batch and minibatch training run here. Which sites a minibatch step
+has to subsample and scale comes from each model's own ``list_obs_plate_vars``:
+the reference model declares none, so only its likelihood scales, while the
+spatial model's five per-location latents are subsampled with the data and
+their priors and log q scale too.
+
+Scope otherwise matches the flat log-joint: no dropout, single particle,
+unscaled ELBO, and a model whose transcription covers it (``log_joint_for``).
+The caller falls back to the pyro path whenever any of that fails to hold; the
+guide is only written to after a finite run, so a diverged flat run leaves the
+model exactly as the pyro path would find it.
 """
 
 import logging
@@ -46,6 +52,7 @@ __all__ = [
     "run_flat_minibatch_training",
     "flat_minibatch_loss",
     "flat_log_q_minibatch",
+    "local_plate_sites",
 ]
 
 #: Set to 0 to disable the flat engine and train through the pyro path unchanged.
@@ -144,21 +151,26 @@ def flat_log_q_from_state(loc_flat, scale_flat, u_flat, state):
     return normal_lp - ladj
 
 
-def _local_plate_sites(module) -> frozenset:
-    """Names of latent sites living inside the observation plate.
+def local_plate_sites(module):
+    """Names of latent sites inside the observation plate, or None if unreadable.
 
     Read from the model's own ``list_obs_plate_vars`` so a model that grows or
     loses a per-observation site changes behaviour without an edit here.
+
+    None and the empty set mean different things and must not be conflated: an
+    empty set says "every latent is global, subsample the data alone", while
+    None says the declaration could not be read at all, which is not a licence
+    to subsample. Callers route None to pyro.
     """
     mod = getattr(module, "model", None)
     mod = getattr(mod, "_orig_mod", mod)
     lister = getattr(mod, "list_obs_plate_vars", None)
     if lister is None:
-        return frozenset()
+        return None
     try:
         return frozenset(lister()["sites"])
-    except Exception:  # noqa: BLE001 - an unreadable declaration means no subsampling
-        return frozenset()
+    except Exception:  # noqa: BLE001 - an unreadable declaration is not a green light
+        return None
 
 
 def flat_log_q_minibatch(state, loc_flat, scale_flat, u_flat, rows, local_sites, plate_scale):
@@ -489,7 +501,7 @@ def run_flat_minibatch_training(model, kwargs, log_joint_fn) -> bool:
                 yield _to_device(args, device), batch_kwargs
 
     probe_args, batch_kwargs = next(epoch_batches())
-    local_sites = _local_plate_sites(module)
+    local_sites = local_plate_sites(module) or frozenset()
     n_obs = model.adata.n_obs
 
     guide = module.guide

@@ -26,13 +26,13 @@ one held its pre-flat-engine capture (569.6 ms/epoch) while master ran at
 Exit code 0 only if every gate passes. Anything else: do not push.
 """
 
-import json
 import sys
 import time
 from pathlib import Path
 
 import numpy as np
-import torch
+
+sys.path.insert(0, str(Path(__file__).parent))
 
 BASELINE = Path(__file__).parent / "reference_baseline.json"
 
@@ -41,30 +41,22 @@ BASELINE = Path(__file__).parent / "reference_baseline.json"
 # run still finishes in seconds. Genes match the spatial harness.
 N_OBS, N_GENES, EPOCHS, BATCH = 10000, 10000, 30, 2500
 
-# Reported timing is the MINIMUM of REPEATS runs after WARMUP_RUNS discarded
-# ones, not the median. Contention can only ADD time to a run, so under load the
-# minimum is the best available estimate of the uncontended cost while the median
-# tracks whatever else the machine is doing: measured on a loaded machine, this
-# workload's runs spread 32.0 / 67.4 / 68.6 while its minimum stayed within 1 ms
-# of a quiet-machine capture. All runs are recorded so the spread stays visible.
-WARMUP_RUNS, REPEATS = 1, 3
-
-# Looser than the instrument can resolve; see the note in engine_validation.py.
-NO_REGRESSION_TOLERANCE = 1.15
+# Reported timing is the MINIMUM of the measured runs, not the median; see the
+# note in engine_validation.py for why. This arm shows the same asymmetry: its
+# own baseline capture ran 86.8 / 49.8 / 49.3 ms/epoch, where the minimum is the
+# uncontended cost and the 86.8 is one run that met something else on the
+# machine. All runs are recorded so the spread stays visible.
+from _gate import (  # noqa: E402
+    QUIET, REPEATS, quiet_libraries, repeat_runs, verdict,
+)
+import json  # noqa: E402
 
 
 def build():
-    import logging
-
-    for name in ("lightning.pytorch", "pytorch_lightning"):
-        logging.getLogger(name).setLevel(logging.ERROR)
-    import pyro
+    import torch
     from scvi.data import synthetic_iid
 
-    # pyro's parameter store is process-global; repeated runs in one process
-    # must not inherit the previous run's guide parameters (which are also on
-    # the previous run's device). See the note in engine_validation.build.
-    pyro.clear_param_store()
+    quiet_libraries()
 
     import cell2location.accel as accel
     from cell2location.models import RegressionModel
@@ -75,9 +67,6 @@ def build():
     accel.prepare_anndata(adata)
     RegressionModel.setup_anndata(adata, labels_key="labels", batch_key="batch")
     return RegressionModel(adata), adata
-
-
-QUIET = {"enable_progress_bar": False, "enable_model_summary": False}
 
 
 def _one_run():
@@ -113,55 +102,25 @@ def _guard_run():
 
 
 def main():
-    import gc
-
-    runs = []
-    for i in range(WARMUP_RUNS + REPEATS):
-        gc.collect()
-        torch.mps.empty_cache()
-        result = _one_run()
-        if i >= WARMUP_RUNS:
-            runs.append(result)
-    order = sorted(runs, key=lambda r: r["train_ms_per_epoch"])
-    metrics = dict(order[0])  # the fastest run, reported whole
+    runs = repeat_runs(_one_run)
+    metrics = dict(min(runs, key=lambda r: r["train_ms_per_epoch"]))
     metrics["guard"] = _guard_run()
     metrics["train_ms_all_runs"] = [round(r["train_ms_per_epoch"], 1) for r in runs]
     metrics["config"] = {
         "n_obs": N_OBS, "n_genes": N_GENES, "epochs": EPOCHS,
         "batch_size": BATCH, "repeats": REPEATS,
     }
-    print(json.dumps(metrics, indent=2, default=str))
 
-    if not BASELINE.exists():
-        BASELINE.write_text(json.dumps(metrics, indent=2, default=str))
-        print("No baseline existed; wrote this run AS the baseline (run on master!). "
-              "Gates not evaluated.")
-        return 2
-
-    base = json.loads(BASELINE.read_text())
-    train_ms = metrics["train_ms_per_epoch"]
-    elbo = metrics["final_elbo"]
+    base_exists = BASELINE.exists()
+    base = json.loads(BASELINE.read_text()) if base_exists else {}
     guard = metrics["guard"]
-    no_regression_only = "--no-regression" in sys.argv
-
-    train_ratio = train_ms / base["train_ms_per_epoch"]
-    checks = {
-        "train_no_regression": train_ratio <= NO_REGRESSION_TOLERANCE,
-        "elbo_parity": abs(elbo - base["final_elbo"]) / abs(base["final_elbo"]) <= 0.005,
+    extra = {} if not base_exists else {
+        "elbo_parity": abs(metrics["final_elbo"] - base["final_elbo"]) / abs(base["final_elbo"]) <= 0.005,
         "guard_clean": guard.get("checks", 0) > 0 and not guard.get("diverged", True)
                        and np.isfinite(guard.get("max_relative_difference", np.inf)),
     }
-    if not no_regression_only:
-        checks["something_got_faster"] = train_ratio <= 0.95
-    print(f"  train {train_ratio:.3f}x baseline"
-          f"{'  [no-regression mode]' if no_regression_only else ''}")
-    for name, ok in checks.items():
-        print(f"  {'ok  ' if ok else 'FAIL'} {name}")
-    if all(checks.values()):
-        print("ALL GATES PASS -- pushable.")
-        return 0
-    print("GATES FAILED -- do not push.")
-    return 1
+    return verdict(metrics, BASELINE, extra, {"train": "train_ms_per_epoch"},
+                   "--no-regression" in sys.argv)
 
 
 if __name__ == "__main__":
