@@ -36,7 +36,14 @@ from ._sampling import NotVectorizable, _autonormal_site_params
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["FLAT_ENGINE_ENV_VAR", "FlatGuideState", "flat_training_loss", "flat_log_q_from_state", "run_flat_training"]
+__all__ = [
+    "FLAT_ENGINE_ENV_VAR",
+    "FlatGuideState",
+    "flat_training_loss",
+    "flat_log_q_from_state",
+    "pack_module",
+    "run_flat_training",
+]
 
 #: Set to 0 to disable the flat engine and train through the pyro path unchanged.
 FLAT_ENGINE_ENV_VAR = "CELL2LOCATION_MPS_FLAT_ENGINE"
@@ -126,6 +133,59 @@ def flat_training_loss(module, state, args, kwargs, eps):
     return -(log_joint - flat_log_q_from_state(state.loc, scale_flat, u_flat, state))
 
 
+#: Small model buffers the flat loss reads; packed into one tensor for the hot
+#: loop. `cell_state` (large) and `n_batch` (int) stay as-is.
+_PACKED_MODEL_ATTRS = (
+    "m_g_mu_mean_var_ratio_hyp", "m_g_mu_hyp", "m_g_alpha_hyp_mean",
+    "N_cells_per_location", "N_cells_mean_var_ratio", "B_groups_per_location",
+    "ones_1_n_groups", "n_groups_tensor", "factors_per_groups", "n_factors_tensor",
+    "w_sf_mean_var_ratio_tensor", "detection_mean_hyp_prior_alpha",
+    "detection_mean_hyp_prior_beta", "detection_hyp_prior_alpha", "ones_n_batch_1",
+    "gene_add_alpha_hyp_prior_alpha", "gene_add_alpha_hyp_prior_beta",
+    "gene_add_mean_hyp_prior_alpha", "gene_add_mean_hyp_prior_beta",
+    "alpha_g_phi_hyp_prior_alpha", "alpha_g_phi_hyp_prior_beta", "ones",
+)
+
+
+class _PackedModel:
+    """The model's small hyperparameter buffers as lazy slices of ONE tensor.
+
+    Attribute access slices inside the caller's graph, so a torch.compile'd flat
+    loss sees a single input buffer where the module would contribute 21 -- the
+    difference between fitting and not fitting Metal's hard 31-constant-buffer
+    kernel limit. Values are copied once at construction; the model's buffers are
+    training-constant, and test_packed_model_proxy_matches_module pins equality.
+    """
+
+    def __init__(self, pyro_model):
+        # One stray float64 buffer (detection_mean_hyp_prior_beta upstream) would
+        # promote the whole pack via torch.cat; pin to the model's working dtype.
+        dtype = pyro_model.cell_state.dtype
+        chunks, layout, offset = [], {}, 0
+        for name in _PACKED_MODEL_ATTRS:
+            tensor = getattr(pyro_model, name).detach()
+            layout[name] = (offset, offset + tensor.numel(), tuple(tensor.shape))
+            chunks.append(tensor.reshape(-1).to(dtype))
+            offset += tensor.numel()
+        self._packed = torch.cat(chunks)
+        self._layout = layout
+        self.cell_state = pyro_model.cell_state
+        self.n_batch = pyro_model.n_batch
+
+    def __getattr__(self, name):
+        layout = object.__getattribute__(self, "_layout")
+        if name not in layout:
+            raise AttributeError(name)
+        start, stop, shape = layout[name]
+        return object.__getattribute__(self, "_packed")[start:stop].view(shape)
+
+
+def pack_module(module):
+    """A module stand-in for the hot training loop: ``.model`` is the packed view."""
+    mod = module.model
+    return SimpleNamespace(model=_PackedModel(getattr(mod, "_orig_mod", mod)))
+
+
 def _flat_guard_check(guard, module, state, args, kwargs, epoch):
     """One guard comparison: flat_log_joint at the same fresh draw on the training
     device and on CPU. Identical latents make it deterministic -- any disagreement
@@ -203,6 +263,7 @@ def run_flat_training(model, kwargs) -> bool:
             guide(*args, **batch_kwargs)
 
     state = FlatGuideState.from_guide(guide)
+    packed = pack_module(module)
     optimizer = _make_optimizer(state, kwargs.get("lr", 0.002))
     max_epochs = kwargs.get("max_epochs", 30000)
     logger.info(
@@ -233,13 +294,13 @@ def run_flat_training(model, kwargs) -> bool:
         optimizer.zero_grad(set_to_none=True)
         eps = torch.randn_like(state.loc)
         try:
-            loss = loss_fn(module, state, args, batch_kwargs, eps)
+            loss = loss_fn(packed, state, args, batch_kwargs, eps)
         except Exception as exc:  # noqa: BLE001 - a compiled step may fail at runtime
             if loss_fn is flat_training_loss:
                 raise
             logger.warning("Compiled flat step failed (%s); retrying eager.", exc)
             loss_fn = flat_training_loss
-            loss = loss_fn(module, state, args, batch_kwargs, eps)
+            loss = loss_fn(packed, state, args, batch_kwargs, eps)
         loss_value = float(loss)
         if not math.isfinite(loss_value):
             logger.warning(
