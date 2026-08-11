@@ -36,11 +36,13 @@ import torch
 from ._flat_joint import _exponential_lp, _gamma_lp, _nb_lp
 
 
-def reference_log_joint(module, args, kwargs, latents):
+def reference_log_joint(module, args, kwargs, latents, plate_scale=None):
     """log p(latents, data) for the reference model, matching pyro replay exactly.
 
     Includes the observation plate's ``n_obs / batch`` scale on the likelihood,
-    so this is correct at full batch and at any minibatch size.
+    so this is correct at full batch and at any minibatch size. ``plate_scale``
+    defaults to computing that ratio from the batch; the shared minibatch runner
+    passes it explicitly so both models' transcriptions take the same argument.
     """
     del kwargs
     x_data, _idx, batch_index, label_index, _extra_categoricals = args
@@ -96,7 +98,8 @@ def reference_log_joint(module, args, kwargs, latents):
     alpha = ones / L["alpha_g_inverse"].pow(2)
     mu = (obs2label @ L["per_cluster_mu_fg"] + obs2sample @ L["s_g_gene_add"]) * detection_y_c
 
-    plate_scale = float(mod.n_obs) / float(x_data.shape[0])
+    if plate_scale is None:
+        plate_scale = float(mod.n_obs) / float(x_data.shape[0])
     lp = lp + plate_scale * _nb_lp(x_data, mu, alpha)
 
     return lp

@@ -1,7 +1,7 @@
 {
-  "train_ms_per_epoch": 32.4931791673104,
+  "train_ms_per_epoch": 31.06169999421885,
   "final_elbo": 210205952.0,
-  "export_seconds": 11.298611792037264,
+  "export_seconds": 10.638091082917526,
   "flat_engine_used": true,
   "export_parity_median_rel": {
     "accessibility": 0.0,
@@ -14,19 +14,19 @@
   "guard": {
     "checks": 3,
     "diverged": false,
-    "max_relative_difference": 2.2656690271413555e-07,
-    "mean_relative_difference": 1.7621116686130107e-07,
+    "max_relative_difference": 2.2656691982499065e-07,
+    "mean_relative_difference": 1.7621117256491942e-07,
     "tolerance": 0.001
   },
   "train_ms_all_runs": [
-    32.0,
-    32.5,
-    32.5
+    31.2,
+    32.2,
+    31.1
   ],
   "export_seconds_all_runs": [
-    11.36,
-    11.3,
-    11.13
+    11.04,
+    10.71,
+    10.64
   ],
   "repeats": 3,
   "minibatch": null

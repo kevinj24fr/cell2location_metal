@@ -42,6 +42,22 @@ numerical guard clean, and posterior summaries matching the replaced path within
 Monte-Carlo error. Changes that do not clear the gate do not merge, and are not
 listed.
 
+- **Minibatch training for the spatial model.** Passing `batch_size` used to
+  drop the spatial model onto the pyro path, so the caller whose data does not
+  fit in memory — the one who needs the help most — got none of this fork. The
+  flat engine now subsamples the observation plate, per-location latents
+  included: the five of them (`w_sf`, `detection_y_s`,
+  `n_s_cells_per_location`, `b_s_groups_per_location`, `z_sr_groups_factors`)
+  are indexed with the data, and their priors and their `log q` carry the
+  plate's `n_obs/batch` scale alongside the likelihood. Which sites those are is
+  read from the model's own `list_obs_plate_vars()`, and each one's guide
+  parameter is checked to actually be indexed by observation before the engine
+  will subsample it — a site shaped otherwise routes to pyro rather than being
+  silently mis-indexed. Measured at 5,000 × 10,000, `batch_size=1250`
+  (M2 Ultra): **440.5 → 70.0 ms/epoch (6.3x)**, ELBO parity, guard clean
+  (2.3e-7), export parity unchanged. The arithmetic is pinned against pyro
+  replay through a genuinely subsampled plate at three batch sizes.
+
 - **Device-resident minibatches.** Profiling the reference model's step showed
   the arithmetic was not the cost: the flat step took 11.4 ms while scvi's
   loader collation plus the host-to-device copy took 16.7 ms, so 59% of each

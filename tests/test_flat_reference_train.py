@@ -87,25 +87,77 @@ def test_reference_guide_is_written_back():
     assert not torch.allclose(trained, untrained), "guide locs unchanged after training"
 
 
-@pytest.mark.skipif(not mps_available, reason="flat engine is the Metal path")
-def test_spatial_minibatch_still_falls_back_to_pyro():
-    """The spatial model has five per-location latents; minibatching it is NOT
-    implemented. A spatial caller passing batch_size must land on pyro rather
-    than on an engine that would scale the likelihood and ignore the locals."""
+def _make_spatial(seed=0, n_obs=200, n_genes=60):
     import pandas as pd
 
     from cell2location.models import Cell2location
 
-    torch.manual_seed(0)
-    np.random.seed(0)
-    adata = scvi_data.synthetic_iid(n_labels=3, batch_size=100, n_genes=60)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    adata = scvi_data.synthetic_iid(n_labels=3, batch_size=n_obs // 2, n_genes=n_genes)
     Cell2location.setup_anndata(adata, batch_key="batch")
-    sig = pd.DataFrame(np.random.rand(60, 3) + 0.1, index=adata.var_names, columns=list("abc"))
-    model = Cell2location(adata, cell_state_df=sig, N_cells_per_location=8, detection_alpha=20)
-    model.train(max_epochs=2, batch_size=100, enable_progress_bar=False,
+    sig = pd.DataFrame(np.random.rand(n_genes, 3) + 0.1,
+                       index=adata.var_names, columns=list("abc"))
+    return Cell2location(adata, cell_state_df=sig, N_cells_per_location=8, detection_alpha=20)
+
+
+@pytest.mark.skipif(not mps_available, reason="flat engine is the Metal path")
+def test_spatial_minibatch_now_runs_on_the_flat_engine():
+    """The spatial model's five per-location latents are subsampled with the
+    data. Was a fallback contract before that was implemented."""
+    model = _make_spatial(seed=0)
+    model.train(max_epochs=4, batch_size=100, enable_progress_bar=False,
                 enable_model_summary=False)
-    assert model.flat_engine_used_ is False
+    assert model.flat_engine_used_ is True
     assert model.is_trained_ is True
+    losses = np.asarray(model.history["elbo_train"], dtype=float).ravel()
+    assert len(losses) == 4 and np.isfinite(losses).all()
+
+
+@pytest.mark.skipif(not mps_available, reason="flat engine is the Metal path")
+def test_guard_actually_runs_under_minibatch():
+    """A guard that cannot evaluate reports zero checks, and zero checks reads
+    like agreement. It has to cut the draw the same way the training step does:
+    this caught the spatial minibatch guard silently never running."""
+    model = _make_spatial(seed=1)
+    model.mps_numerical_guard_every_n_steps = 1
+    model.train(max_epochs=3, batch_size=100, enable_progress_bar=False,
+                enable_model_summary=False)
+    assert model.flat_engine_used_ is True
+    summary = model.numerical_guard_.summary()
+    assert summary["checks"] > 0, "guard never ran under minibatch"
+    assert summary["diverged"] is False
+    assert np.isfinite(summary["max_relative_difference"])
+
+
+@pytest.mark.skipif(not mps_available, reason="flat engine is the Metal path")
+def test_spatial_minibatch_lands_where_pyro_lands():
+    """The engine has to be a faster route to the same place, not a different
+    objective. Same data and batch size, flat engine against the pyro path it
+    replaces, compared on the recorded loss after equal epochs."""
+    flat_model = _make_spatial(seed=5)
+    flat_model.mps_early_stopping = None
+    flat_model.train(max_epochs=40, batch_size=100, enable_progress_bar=False,
+                     enable_model_summary=False)
+    assert flat_model.flat_engine_used_ is True
+
+    import os
+
+    os.environ["CELL2LOCATION_MPS_FLAT_ENGINE"] = "0"
+    try:
+        pyro_model = _make_spatial(seed=5)
+        pyro_model.mps_early_stopping = None
+        pyro_model.train(max_epochs=40, batch_size=100, enable_progress_bar=False,
+                         enable_model_summary=False)
+    finally:
+        os.environ.pop("CELL2LOCATION_MPS_FLAT_ENGINE", None)
+    assert pyro_model.flat_engine_used_ is False
+
+    a = float(np.asarray(flat_model.history["elbo_train"], dtype=float).ravel()[-1])
+    b = float(np.asarray(pyro_model.history["elbo_train"], dtype=float).ravel()[-1])
+    # Single-draw ELBO estimates from different RNG streams: a scale comparison,
+    # not equality. A missing or misplaced plate scale shows up as a factor.
+    assert abs(a - b) <= 0.10 * abs(b), f"flat {a:.6g} vs pyro {b:.6g}"
 
 
 def test_minibatch_support_reads_the_models_own_declaration():

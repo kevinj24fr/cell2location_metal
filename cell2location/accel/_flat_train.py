@@ -44,6 +44,8 @@ __all__ = [
     "pack_module",
     "run_flat_training",
     "run_flat_minibatch_training",
+    "flat_minibatch_loss",
+    "flat_log_q_minibatch",
 ]
 
 #: Set to 0 to disable the flat engine and train through the pyro path unchanged.
@@ -101,6 +103,22 @@ class FlatGuideState:
             for name, shape, sl, transform in zip(self.names, self.shapes, self.slices, self.transforms)
         }
 
+    def constrain_rows(self, u_flat, rows, local_sites):
+        """Constrained latents with per-observation sites cut to ``rows``.
+
+        The guide's local parameters stay full size and are drawn whole -- they
+        are tiny next to the data (locations x factors, against locations x
+        genes) -- and only the rows this batch needs enter the graph. Rows not in
+        the batch get no gradient, which is what a subsampled plate means.
+        """
+        out = {}
+        for name, shape, sl, transform in zip(self.names, self.shapes, self.slices, self.transforms):
+            u = u_flat[sl].view(shape)
+            if name in local_sites:
+                u = u[rows]
+            out[name] = transform(u)
+        return out
+
     def write_back(self, guide):
         """Copy the trained parameters into the guide so export reads them."""
         from pyro.infer.autoguide.utils import deep_getattr
@@ -124,6 +142,76 @@ def flat_log_q_from_state(loc_flat, scale_flat, u_flat, state):
         u = u_flat[sl].view(shape)
         ladj = ladj + transform.log_abs_det_jacobian(u, transform(u)).sum()
     return normal_lp - ladj
+
+
+def _local_plate_sites(module) -> frozenset:
+    """Names of latent sites living inside the observation plate.
+
+    Read from the model's own ``list_obs_plate_vars`` so a model that grows or
+    loses a per-observation site changes behaviour without an edit here.
+    """
+    mod = getattr(module, "model", None)
+    mod = getattr(mod, "_orig_mod", mod)
+    lister = getattr(mod, "list_obs_plate_vars", None)
+    if lister is None:
+        return frozenset()
+    try:
+        return frozenset(lister()["sites"])
+    except Exception:  # noqa: BLE001 - an unreadable declaration means no subsampling
+        return frozenset()
+
+
+def flat_log_q_minibatch(state, loc_flat, scale_flat, u_flat, rows, local_sites, plate_scale):
+    """log q for a subsampled plate: global sites whole, local sites cut to the
+    batch's rows and scaled, matching how pyro scales guide sites inside a plate.
+
+    Per-site rather than one fused Normal over the flat vector, because the local
+    and global blocks are interleaved in that vector and carry different scales.
+    """
+    if not local_sites:
+        # Every site global: log q is unscaled and the sites are contiguous in the
+        # flat vector, so the fused whole-vector form applies unchanged. Taking
+        # the per-site path here instead costs real time -- it replaces one large
+        # Normal evaluation with one per site, and measured 1.26x slower on the
+        # reference model, which has nine of them.
+        return flat_log_q_from_state(loc_flat, scale_flat, u_flat, state)
+
+    glob = u_flat.new_zeros(())
+    local = u_flat.new_zeros(())
+    for name, shape, sl, transform in zip(state.names, state.shapes, state.slices, state.transforms):
+        u = u_flat[sl].view(shape)
+        loc = loc_flat[sl].view(shape)
+        scale = scale_flat[sl].view(shape)
+        if name in local_sites:
+            u, loc, scale = u[rows], loc[rows], scale[rows]
+        normal_lp = (
+            -0.5 * ((u - loc) / scale).pow(2) - torch.log(scale) - 0.5 * _LOG_2PI
+        ).sum()
+        term = normal_lp - transform.log_abs_det_jacobian(u, transform(u)).sum()
+        if name in local_sites:
+            local = local + term
+        else:
+            glob = glob + term
+    return glob + plate_scale * local
+
+
+def flat_minibatch_loss(module, state, args, kwargs, eps, rows, local_sites,
+                        plate_scale, log_joint_fn):
+    """-(single-particle ELBO estimate) for one minibatch.
+
+    Serves both models. The reference model's ``local_sites`` is empty, so every
+    site is global and only its transcription's likelihood carries the scale;
+    the spatial model's five per-location sites are subsampled here and their
+    priors and log q scale along with the likelihood.
+    """
+    scale_flat = torch.nn.functional.softplus(state.rho)
+    u_flat = state.loc + scale_flat * eps
+    latents = state.constrain_rows(u_flat, rows, local_sites)
+    log_joint = log_joint_fn(module, args, kwargs, latents, plate_scale)
+    log_q = flat_log_q_minibatch(
+        state, state.loc, scale_flat, u_flat, rows, local_sites, plate_scale
+    )
+    return -(log_joint - log_q)
 
 
 def flat_training_loss(module, state, args, kwargs, eps, log_joint_fn=None):
@@ -218,20 +306,30 @@ def pack_module(module):
     return SimpleNamespace(model=_PackedModel(getattr(mod, "_orig_mod", mod)))
 
 
-def _flat_guard_check(guard, module, state, args, kwargs, epoch, log_joint_fn=None):
-    """One guard comparison: flat_log_joint at the same fresh draw on the training
-    device and on CPU. Identical latents make it deterministic -- any disagreement
-    is device arithmetic, and it is exactly the arithmetic the flat engine trains
-    on (the pyro-path guard compares the replayed model log-joint instead)."""
+def _flat_guard_check(guard, module, state, args, kwargs, epoch, log_joint_fn=None,
+                      rows=None, local_sites=frozenset(), plate_scale=None):
+    """One guard comparison: the flat log-joint at the same fresh draw on the
+    training device and on CPU. Identical latents make it deterministic -- any
+    disagreement is device arithmetic, and it is exactly the arithmetic the flat
+    engine trains on (the pyro-path guard compares the replayed model log-joint).
+
+    On a minibatch the draw must be cut the same way the training step cuts it,
+    ``rows`` and all, or the comparison is not of the arithmetic being trained.
+    A guard that cannot evaluate is reported at warning level: silence there
+    reads as agreement, and "checks: 0" is a verifier that never ran."""
     if log_joint_fn is None:
         log_joint_fn = flat_log_joint
+    extra = () if plate_scale is None else (plate_scale,)
     with torch.no_grad():
         u_flat = state.loc + torch.nn.functional.softplus(state.rho) * torch.randn_like(state.loc)
-        latents = state.constrain(u_flat)
+        latents = (
+            state.constrain(u_flat) if rows is None
+            else state.constrain_rows(u_flat, rows, local_sites)
+        )
         try:
-            device_loss = float(log_joint_fn(module, args, kwargs, latents))
+            device_loss = float(log_joint_fn(module, args, kwargs, latents, *extra))
         except Exception as exc:  # noqa: BLE001 - a failed check must not kill training
-            logger.debug("Flat guard: device evaluation failed (%s).", exc)
+            logger.warning("Flat guard: device evaluation failed (%s); check skipped.", exc)
             return None
         original_device = state.loc.device
         try:
@@ -239,11 +337,11 @@ def _flat_guard_check(guard, module, state, args, kwargs, epoch, log_joint_fn=No
             cpu_args = tuple(a.cpu() if torch.is_tensor(a) else a for a in args)
             module.to("cpu")
             try:
-                reference_loss = float(log_joint_fn(module, cpu_args, kwargs, cpu_latents))
+                reference_loss = float(log_joint_fn(module, cpu_args, kwargs, cpu_latents, *extra))
             finally:
                 module.to(original_device)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("Flat guard: CPU evaluation failed (%s).", exc)
+            logger.warning("Flat guard: CPU evaluation failed (%s); check skipped.", exc)
             return None
 
     scale = max(abs(reference_loss), 1e-12)
@@ -352,19 +450,22 @@ def _to_device(args, device):
 
 
 def run_flat_minibatch_training(model, kwargs, log_joint_fn) -> bool:
-    """Minibatch flat training for models whose latents are all global.
+    """Minibatch flat training. Serves both models through one path.
 
-    The reference model's ``list_obs_plate_vars()["sites"]`` is empty, so a
-    minibatch step subsamples data only: the guide is global and unscaled, and
-    ``log_joint_fn`` carries the observation plate's n_obs/batch scale. Each
-    step's loss therefore estimates the FULL-data negative ELBO, which is what
-    scvi's ``elbo_train`` records (it is the epoch mean of per-step losses), so
-    the histories are directly comparable.
+    What a minibatch step has to scale depends on the model. The reference
+    model's ``list_obs_plate_vars()["sites"]`` is empty -- every latent global --
+    so only the likelihood scales. The spatial model has five per-location
+    latents, so those latents are subsampled with the data and their priors and
+    log q scale too. Both cases fall out of reading the model's own declaration.
 
-    Batches come from scvi's AnnDataLoader rather than a device-resident copy of
-    the whole matrix: a caller who passed ``batch_size`` may have done so because
-    the data does not fit, and silently materialising all of it would defeat the
-    reason they asked.
+    Each step's loss estimates the FULL-data negative ELBO, and history records
+    the epoch mean of them -- what scvi's ``elbo_train`` is -- so the two paths'
+    histories and early-stopping signals mean the same thing.
+
+    Batches come from scvi's AnnDataLoader unless the data comfortably fits on
+    the device: a caller who passed ``batch_size`` may have done so because it
+    does not, and silently materialising all of it would defeat the reason they
+    asked.
 
     Returns False (guide untouched) if the engine diverges.
     """
@@ -388,6 +489,8 @@ def run_flat_minibatch_training(model, kwargs, log_joint_fn) -> bool:
                 yield _to_device(args, device), batch_kwargs
 
     probe_args, batch_kwargs = next(epoch_batches())
+    local_sites = _local_plate_sites(module)
+    n_obs = model.adata.n_obs
 
     guide = module.guide
     if getattr(guide, "prototype_trace", None) is None:
@@ -423,9 +526,15 @@ def run_flat_minibatch_training(model, kwargs, log_joint_fn) -> bool:
     for epoch in range(max_epochs):
         epoch_losses = []
         for args, batch_kwargs in epoch_batches():
+            # args[1] is ind_x: the batch's ORIGINAL observation indices, which
+            # are exactly the guide rows a subsampled plate touches.
+            rows = args[1].reshape(-1).long()
+            plate_scale = float(n_obs) / float(args[0].shape[0])
+
             optimizer.zero_grad(set_to_none=True)
             eps = torch.randn_like(state.loc)
-            loss = flat_training_loss(packed, state, args, batch_kwargs, eps, log_joint_fn)
+            loss = flat_minibatch_loss(packed, state, args, batch_kwargs, eps, rows,
+                                       local_sites, plate_scale, log_joint_fn)
             loss_value = float(loss)
             if not math.isfinite(loss_value):
                 logger.warning(
@@ -438,7 +547,8 @@ def run_flat_minibatch_training(model, kwargs, log_joint_fn) -> bool:
             epoch_losses.append(loss_value)
 
             if guard is not None and guard.every_n_steps and step % guard.every_n_steps == 0:
-                _flat_guard_check(guard, module, state, args, batch_kwargs, step, log_joint_fn)
+                _flat_guard_check(guard, module, state, args, batch_kwargs, step,
+                                  log_joint_fn, rows, local_sites, plate_scale)
             step += 1
 
         # scvi logs elbo_train as the epoch MEAN of per-step losses; match it so
