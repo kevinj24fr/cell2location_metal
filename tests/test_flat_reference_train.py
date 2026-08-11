@@ -293,3 +293,21 @@ def test_packed_reference_model_matches_module():
         ), name
     assert packed.n_obs == real.n_obs
     assert packed.n_factors == real.n_factors
+
+
+@pytest.mark.skipif(not mps_available, reason="flat engine is the Metal path")
+def test_max_epochs_none_resolves_like_the_pyro_path():
+    """RegressionModel.train documents max_epochs=None as "use the heuristic" and
+    passes the None straight through, so the key is present with a None value --
+    kwargs.get("max_epochs", default) returns None, not the default. Every
+    synthetic benchmark passes an explicit count, so this only surfaced on a real
+    675k-cell run, as a %d format error mid-training."""
+    from scvi.model._utils import get_max_epochs_heuristic
+
+    model = _make_reference(seed=11)
+    model.mps_early_stopping = None
+    model.train(max_epochs=None, batch_size=50, enable_progress_bar=False,
+                enable_model_summary=False)
+    assert model.flat_engine_used_ is True
+    expected = get_max_epochs_heuristic(model.adata.n_obs, epochs_cap=1000)
+    assert len(np.asarray(model.history["elbo_train"], dtype=float).ravel()) == expected
