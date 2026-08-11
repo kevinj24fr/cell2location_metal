@@ -158,6 +158,74 @@ def test_spatial_initial_values_still_route_to_pyro():
     assert _flat_joint.log_joint_for(model.module) is None
 
 
+@pytest.mark.skipif(not mps_available, reason="flat engine is the Metal path")
+def test_streamed_and_resident_paths_agree(monkeypatch):
+    """Staging the matrix on the device must be a pure performance choice. Both
+    paths see the same data in the same batch sizes, so their training curves
+    have to land in the same place -- otherwise residency changes results."""
+    from cell2location.accel import _flat_train
+
+    resident = _make_reference(seed=7)
+    resident.mps_early_stopping = None
+    resident.train(max_epochs=15, batch_size=50, enable_progress_bar=False,
+                   enable_model_summary=False)
+
+    monkeypatch.setattr(_flat_train, "_resident_fits", lambda model, device: False)
+    streamed = _make_reference(seed=7)
+    streamed.mps_early_stopping = None
+    streamed.train(max_epochs=15, batch_size=50, enable_progress_bar=False,
+                   enable_model_summary=False)
+
+    assert resident.flat_engine_used_ is True
+    assert streamed.flat_engine_used_ is True
+    a = float(np.asarray(resident.history["elbo_train"], dtype=float)[-1])
+    b = float(np.asarray(streamed.history["elbo_train"], dtype=float)[-1])
+    # Different shuffle RNGs, so this is a scale comparison, not bitwise equality.
+    assert abs(a - b) <= 0.05 * abs(b), f"resident {a:.6g} vs streamed {b:.6g}"
+
+
+def test_residency_declines_when_the_data_would_not_fit(monkeypatch):
+    """The reason a caller passes batch_size may be that the data does not fit.
+    Residency must be a measured decision against the driver's budget, and must
+    decline rather than assume when the budget is unavailable."""
+    from cell2location.accel import _flat_train
+
+    model = _make_reference(seed=0)
+    device = torch.device("mps")
+
+    monkeypatch.setattr(torch.mps, "recommended_max_memory", lambda: 512 * 1024**3)
+    assert _flat_train._resident_fits(model, device) is True
+
+    # A budget the matrix cannot claim a quarter of: the fixture's counts are
+    # 200 x 50 float32 (~42 KB), so 64 KiB leaves it well over the fraction.
+    monkeypatch.setattr(torch.mps, "recommended_max_memory", lambda: 64 * 1024)
+    assert _flat_train._resident_fits(model, device) is False
+
+    monkeypatch.setattr(torch.mps, "recommended_max_memory", lambda: 0)
+    assert _flat_train._resident_fits(model, device) is False
+
+    assert _flat_train._resident_fits(model, torch.device("cpu")) is False
+
+
+@pytest.mark.skipif(not mps_available, reason="flat engine is the Metal path")
+def test_resident_batches_cover_every_observation_once():
+    """A permutation per epoch, not sampling with replacement: every observation
+    must appear exactly once, including in a trailing partial batch."""
+    from cell2location.accel._flat_train import _ResidentBatches
+
+    model = _make_reference(seed=0)
+    model.module.to(torch.device("mps"))
+    batches = _ResidentBatches(model, 70, torch.device("mps"))  # 200 = 70+70+60
+
+    sizes, total_rows = [], []
+    for args, _kwargs in batches:
+        sizes.append(args[0].shape[0])
+        total_rows.append(args[0].shape[0])
+    assert sizes == [70, 70, 60]
+    assert sum(total_rows) == N_OBS
+    assert len(batches) == 3
+
+
 def test_packed_reference_model_matches_module():
     """The packed proxy must reproduce the model's buffers exactly -- it is what
     the training loop reads instead of the module."""

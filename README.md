@@ -42,6 +42,21 @@ numerical guard clean, and posterior summaries matching the replaced path within
 Monte-Carlo error. Changes that do not clear the gate do not merge, and are not
 listed.
 
+- **Device-resident minibatches.** Profiling the reference model's step showed
+  the arithmetic was not the cost: the flat step took 11.4 ms while scvi's
+  loader collation plus the host-to-device copy took 16.7 ms, so 59% of each
+  step went to moving data that never changes. When the training matrix fits on
+  the device with headroom it is now staged once and minibatches are gathered
+  there. Residency is a measured decision, not an assumption — a caller passing
+  `batch_size` may be doing it precisely because the data does not fit, so the
+  estimate is checked against the driver's recommended working set (and
+  declines when that is unavailable). Batch composition is unchanged: a fresh
+  permutation each epoch, trailing partial batch kept. Measured at 10,000 ×
+  10,000, `batch_size=2500` (M2 Ultra): **182.2 → 119.6 ms/epoch (1.52x)**,
+  median of three runs, ELBO parity, guard clean (1.6e-7). Both paths are
+  pinned to agree on where training lands, so residency stays a performance
+  choice rather than a numerical one.
+
 - **Flat engine for the reference signature model, with minibatches.** Every
   number below this entry describes the spatial model. The reference model --
   step 1 of every workflow, where per-cluster expression signatures are
