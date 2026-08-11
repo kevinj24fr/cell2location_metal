@@ -283,6 +283,70 @@ def _minibatch_loader(model, batch_size):
     return AnnDataLoader(model.adata_manager, shuffle=True, batch_size=batch_size)
 
 
+#: Fraction of the MPS recommended working set the resident copy may occupy.
+#: The copy is only part of the step's footprint -- activations of the same order
+#: are allocated per step -- so this stays well clear of the whole budget.
+_RESIDENT_MEMORY_FRACTION = 0.25
+
+
+def _resident_fits(model, device) -> bool:
+    """True when the whole training matrix can live on the device with headroom.
+
+    A caller passing ``batch_size`` may be doing it because the data does not
+    fit, so residency is a measured decision, not an assumption: estimate the
+    copy against the driver's recommended working set and decline if it is a
+    meaningful fraction of it. Declining costs performance; guessing wrong costs
+    the run.
+    """
+    if device.type != "mps":
+        return False
+    adata = getattr(model, "adata", None)
+    if adata is None:
+        return False
+    try:
+        budget = torch.mps.recommended_max_memory()
+    except (AttributeError, RuntimeError):
+        return False
+    if not budget:
+        return False
+    # float32 counts plus the per-observation index/batch/label columns.
+    estimate = adata.n_obs * (adata.n_vars + 3) * 4
+    return estimate <= _RESIDENT_MEMORY_FRACTION * budget
+
+
+class _ResidentBatches:
+    """Minibatches cut from one device-resident copy of the data.
+
+    Profiling the streaming path at 10,000x10,000 showed the flat step itself at
+    11.4 ms while scvi's loader collation plus the host-to-device copy cost
+    16.7 ms -- 59% of the step spent moving data that never changes. Staging it
+    once and gathering rows on the device removes that per-step CPU work.
+
+    Batch composition is equivalent to the loader's: a fresh permutation each
+    epoch, same batch size, trailing partial batch kept (the plate scale reads
+    the actual batch length, so a short last batch stays correct).
+    """
+
+    def __init__(self, model, batch_size, device):
+        args, self.kwargs = _full_batch_args(model, device)
+        self.args = args
+        self.n_obs = args[0].shape[0]
+        self.batch_size = batch_size
+        self.device = device
+
+    def __iter__(self):
+        perm = torch.randperm(self.n_obs, device=self.device)
+        for start in range(0, self.n_obs, self.batch_size):
+            rows = perm[start : start + self.batch_size]
+            yield tuple(
+                a[rows] if torch.is_tensor(a) and a.shape[:1] == (self.n_obs,) else a
+                for a in self.args
+            ), self.kwargs
+
+    def __len__(self):
+        return (self.n_obs + self.batch_size - 1) // self.batch_size
+
+
 def _to_device(args, device):
     return tuple(a.to(device) if torch.is_tensor(a) else a for a in args)
 
@@ -308,9 +372,22 @@ def run_flat_minibatch_training(model, kwargs, log_joint_fn) -> bool:
     device = torch.device("mps")
     module.to(device)
 
-    loader = _minibatch_loader(model, kwargs["batch_size"])
-    probe_args, batch_kwargs = module._get_fn_args_from_batch(next(iter(loader)))
-    probe_args = _to_device(probe_args, device)
+    batch_size = kwargs["batch_size"]
+    resident = _resident_fits(model, device)
+    if resident:
+        batches = _ResidentBatches(model, batch_size, device)
+
+        def epoch_batches():
+            return iter(batches)
+    else:
+        loader = _minibatch_loader(model, batch_size)
+
+        def epoch_batches():
+            for batch in loader:
+                args, batch_kwargs = module._get_fn_args_from_batch(batch)
+                yield _to_device(args, device), batch_kwargs
+
+    probe_args, batch_kwargs = next(epoch_batches())
 
     guide = module.guide
     if getattr(guide, "prototype_trace", None) is None:
@@ -323,10 +400,11 @@ def run_flat_minibatch_training(model, kwargs, log_joint_fn) -> bool:
     optimizer = _make_optimizer(state, lr)
     max_epochs = kwargs.get("max_epochs", 30000)
     logger.info(
-        "Flat engine (minibatch): training %s up to %d epochs (%d parameters, "
-        "batch_size=%d, lr=%g).",
+        "Flat engine (minibatch, %s data): training %s up to %d epochs "
+        "(%d parameters, batch_size=%d, lr=%g).",
+        "device-resident" if resident else "streamed",
         type(getattr(module, "model", module)).__name__, max_epochs,
-        state.loc.numel(), kwargs["batch_size"], lr,
+        state.loc.numel(), batch_size, lr,
     )
 
     guard = None
@@ -344,10 +422,7 @@ def run_flat_minibatch_training(model, kwargs, log_joint_fn) -> bool:
     step = 0
     for epoch in range(max_epochs):
         epoch_losses = []
-        for batch in loader:
-            args, batch_kwargs = module._get_fn_args_from_batch(batch)
-            args = _to_device(args, device)
-
+        for args, batch_kwargs in epoch_batches():
             optimizer.zero_grad(set_to_none=True)
             eps = torch.randn_like(state.loc)
             loss = flat_training_loss(packed, state, args, batch_kwargs, eps, log_joint_fn)
