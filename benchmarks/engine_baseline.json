@@ -1,13 +1,31 @@
 {
-  "train_ms_per_epoch": 274.89432639752823,
-  "final_elbo": 210144960.0,
+  "train_ms_per_epoch": 73.05516806275894,
+  "final_elbo": 210174976.0,
   "guard": {
     "checks": 3,
     "diverged": false,
-    "max_relative_difference": 1.5301339609330788e-07,
-    "mean_relative_difference": 1.2684130973766644e-07,
+    "max_relative_difference": 2.2656690271413555e-07,
+    "mean_relative_difference": 1.7621116686130107e-07,
     "tolerance": 0.001
   },
-  "export_seconds": 181.22907995805144,
-  "export_parity_median_rel": {}
+  "export_seconds": 10.836131291929632,
+  "export_parity_median_rel": {
+    "accessibility": 0.0,
+    "protein_expression": 0.0,
+    "means_cell_abundance_w_sf": 0.00302780419588089,
+    "stds_cell_abundance_w_sf": 0.02213972806930542,
+    "q05_cell_abundance_w_sf": 0.006247745826840401,
+    "q95_cell_abundance_w_sf": 0.00622658571228385
+  },
+  "train_ms_all_runs": [
+    73.1,
+    72.0,
+    73.4
+  ],
+  "export_seconds_all_runs": [
+    11.22,
+    10.69,
+    10.84
+  ],
+  "repeats": 3
 }

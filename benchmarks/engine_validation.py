@@ -1,13 +1,26 @@
-"""Push gate for engine changes: better performance AND no precision regression.
+"""Push gate for spatial-model engine changes: better performance AND no
+precision regression.
 
 Runs the current checkout at Visium scale on MPS and verdicts against
 ``benchmarks/engine_baseline.json`` (captured on master). Gates:
 
-  train   ms/epoch <= baseline * 0.95   (an engine change must actually pay)
+  train   ms/epoch <= baseline * 1.05    (no regression)
+  export  seconds  <= baseline * 1.05    (no regression)
+  paid    at least one of the two <= baseline * 0.95
   elbo    |final - baseline| / |baseline| <= 0.005
   guard   checks > 0 and not diverged and max relative difference finite
-  export  seconds <= baseline * 0.5, and fast-vs-looped summary parity within
-          Monte-Carlo error (medians: means <= 2%, quantiles <= 3%)
+  export  fast-vs-looped summary parity within Monte-Carlo error
+          (medians: means <= 2%, quantiles <= 3%)
+
+Run with ``--no-regression`` to drop the "paid" requirement. That is the mode
+for a change aimed at the OTHER arm (the reference model, gated by
+``reference_validation.py``) that touches shared flat-engine code: it still
+must not regress this arm, but there is no reason for it to speed this arm up.
+
+The thresholds are ratios against master, so **the baseline must be recaptured
+on master after every merged engine change**. A stale baseline does not fail
+loudly -- it passes everything. This one held its pre-flat-engine capture long
+enough that changes were clearing it by 3x while regressing against master.
 
 Exit code 0 only if every gate passes. Anything else: do not push.
 """
@@ -22,6 +35,11 @@ import torch
 
 BASELINE = Path(__file__).parent / "engine_baseline.json"
 N_OBS, N_GENES, EPOCHS = 5000, 10000, 30
+
+# Timing is the MEDIAN of REPEATS runs after WARMUP_RUNS discarded ones. One run
+# is not enough to resolve the 5% these gates test: the companion reference
+# harness read 364 ms/epoch on a workload whose median was 130 ms.
+WARMUP_RUNS, REPEATS = 1, 3
 
 
 def build():
@@ -47,7 +65,9 @@ def build():
     return model, adata
 
 
-def main():
+def _timed_run():
+    """One build + train + fast export. Returns its metrics and its model/adata,
+    so the parity comparison can be run against the median run specifically."""
     quiet = {"enable_progress_bar": False, "enable_model_summary": False}
     model, adata = build()
     model.mps_numerical_guard_every_n_steps = 10
@@ -61,34 +81,96 @@ def main():
     t0 = time.perf_counter()
     out_fast = model.export_posterior(adata, sample_kwargs={"num_samples": 1000, "batch_size": adata.n_obs})
     export_s = time.perf_counter() - t0
-    key = next(k for k in out_fast.obsm if k.startswith("means"))
     fast = {k: np.asarray(out_fast.obsm[k]) for k in out_fast.obsm}
 
-    # The fast/looped parity comparison only exists on checkouts that HAVE the fast
-    # path. On a baseline checkout (master), the single export above already ran the
-    # looped sampler; record it and skip parity.
-    parity = {}
+    return {
+        "train_ms_per_epoch": train_ms,
+        "final_elbo": elbo,
+        "guard": guard,
+        "export_seconds": export_s,
+    }, model, adata, fast
+
+
+def _parity(model, adata, fast):
+    """Fast-vs-looped summary parity, computed once on the reported run.
+
+    Deterministic given the trained guide, so unlike the timings it does not
+    need repeating -- and the looped sampler is the most expensive thing here.
+    Only exists on checkouts that HAVE the fast path; on a baseline checkout the
+    export above already ran the looped sampler, so parity is empty.
+    """
     try:
         from cell2location.accel import _sampling
     except ImportError:
-        _sampling = None
-    if _sampling is not None:
-        orig = _sampling.vectorized_posterior_samples
+        return {}
 
-        def _refuse(*a, **k):
-            raise _sampling.NotVectorizable("forced looped baseline")
+    orig = _sampling.vectorized_posterior_samples
 
-        _sampling.vectorized_posterior_samples = _refuse
-        out_slow = model.export_posterior(adata, sample_kwargs={"num_samples": 1000, "batch_size": adata.n_obs})
+    def _refuse(*a, **k):
+        raise _sampling.NotVectorizable("forced looped baseline")
+
+    _sampling.vectorized_posterior_samples = _refuse
+    try:
+        out_slow = model.export_posterior(
+            adata, sample_kwargs={"num_samples": 1000, "batch_size": adata.n_obs}
+        )
+    finally:
         _sampling.vectorized_posterior_samples = orig
-        for k in fast:
-            if k in out_slow.obsm:
-                s = np.asarray(out_slow.obsm[k])
-                parity[k] = float(np.median(np.abs(fast[k] - s) / (np.abs(s) + 1e-6)))
 
-    metrics = {"train_ms_per_epoch": train_ms, "final_elbo": elbo, "guard": guard,
-               "export_seconds": export_s, "export_parity_median_rel": parity}
+    parity = {}
+    for k in fast:
+        if k in out_slow.obsm:
+            s = np.asarray(out_slow.obsm[k])
+            parity[k] = float(np.median(np.abs(fast[k] - s) / (np.abs(s) + 1e-6)))
+    return parity
+
+
+def main():
+    # Timing this workload needed two corrections, both found by watching the
+    # per-run numbers rather than the median:
+    #   * Holding every repeat's model alive at once (three 5,000x10,000 datasets
+    #     plus posterior samples) made each run slower than the last
+    #     (73.8 -> 80.1 -> 91.5). The harness was measuring its own footprint.
+    #     Only the last run's model is kept now; the rest are freed.
+    #   * With that fixed the order reversed (95.8 -> 81.1 -> 73.2): the first
+    #     run pays warmup. It is now run and discarded.
+    # Runs are seeded identically and produce bit-identical ELBO and guard
+    # values, so the kept run's numbers describe them all; only timing varies.
+    import gc
+
+    timings, kept = [], None
+    total = WARMUP_RUNS + REPEATS
+    for i in range(total):
+        if kept is not None:
+            del kept
+            gc.collect()
+            torch.mps.empty_cache()
+            kept = None
+        result = _timed_run()
+        if i >= WARMUP_RUNS:
+            timings.append(result[0])
+        if i == total - 1:
+            kept = result
+
+    metrics, model, adata, fast = kept
+    metrics = dict(metrics)
+    train_all = sorted(t["train_ms_per_epoch"] for t in timings)
+    export_all = sorted(t["export_seconds"] for t in timings)
+    metrics["train_ms_per_epoch"] = train_all[len(train_all) // 2]
+    metrics["export_seconds"] = export_all[len(export_all) // 2]
+    runs = [(t,) for t in timings]
+    key = next(k for k in fast if k.startswith("means"))
+
+    metrics["export_parity_median_rel"] = _parity(model, adata, fast)
+    metrics["train_ms_all_runs"] = [round(r[0]["train_ms_per_epoch"], 1) for r in runs]
+    metrics["export_seconds_all_runs"] = [round(r[0]["export_seconds"], 2) for r in runs]
+    metrics["repeats"] = REPEATS
     print(json.dumps(metrics, indent=2, default=str))
+    parity = metrics["export_parity_median_rel"]
+    train_ms = metrics["train_ms_per_epoch"]
+    elbo = metrics["final_elbo"]
+    guard = metrics["guard"]
+    export_s = metrics["export_seconds"]
 
     if not BASELINE.exists():
         BASELINE.write_text(json.dumps(metrics, indent=2, default=str))
@@ -97,15 +179,24 @@ def main():
         return 2
 
     base = json.loads(BASELINE.read_text())
+    no_regression_only = "--no-regression" in sys.argv
+
+    train_ratio = train_ms / base["train_ms_per_epoch"]
+    export_ratio = export_s / base["export_seconds"]
     checks = {
-        "train_faster": train_ms <= base["train_ms_per_epoch"] * 0.95,
+        "train_no_regression": train_ratio <= 1.05,
+        "export_no_regression": export_ratio <= 1.05,
         "elbo_parity": abs(elbo - base["final_elbo"]) / abs(base["final_elbo"]) <= 0.005,
         "guard_clean": guard.get("checks", 0) > 0 and not guard.get("diverged", True)
                        and np.isfinite(guard.get("max_relative_difference", np.inf)),
-        "export_faster": export_s <= base["export_seconds"] * 0.5,
         "export_means_parity": parity.get(key, 1.0) <= 0.02,
         "export_quantile_parity": all(v <= 0.03 for kk, v in parity.items() if kk.startswith("q")),
     }
+    if not no_regression_only:
+        # An engine change aimed at this arm must actually pay somewhere.
+        checks["something_got_faster"] = min(train_ratio, export_ratio) <= 0.95
+    print(f"  train {train_ratio:.3f}x baseline, export {export_ratio:.3f}x baseline"
+          f"{'  [no-regression mode]' if no_regression_only else ''}")
     for name, ok in checks.items():
         print(f"  {'ok  ' if ok else 'FAIL'} {name}")
     if all(checks.values()):

@@ -1,18 +1,18 @@
 {
-  "train_ms_per_epoch": 182.24038750243685,
-  "final_elbo": 394594704.0,
+  "train_ms_per_epoch": 51.490988869530455,
+  "final_elbo": 393715328.0,
+  "flat_engine_used": true,
   "guard": {
     "checks": 12,
     "diverged": false,
-    "max_relative_difference": 2.3793231111267617e-07,
-    "mean_relative_difference": 1.3654403715395982e-07,
+    "max_relative_difference": 1.6178936448490473e-07,
+    "mean_relative_difference": 1.2322740788006174e-07,
     "tolerance": 0.001
   },
-  "flat_engine_used": true,
   "train_ms_all_runs": [
-    166.6,
-    182.2,
-    192.8
+    51.4,
+    51.5,
+    52.0
   ],
   "config": {
     "n_obs": 10000,
