@@ -18,11 +18,21 @@ staying behaviourally identical to upstream on CPU and CUDA.
   run, not on synthetic shapes.
 - **`torch.compile` on Metal.** `train_compiled()` works (torch ≥ 2.12) and arms the
   guard automatically.
-- **Measured on an M2 Ultra** (5,000 locations × 10,000 genes, full batch):
-  CPU 742 ms/epoch → Metal 140 ms/epoch out of the box (5.2x) → ~114 ms/epoch
-  compiled (6.5x), with guard-verified CPU/GPU agreement at 2×10⁻⁷ relative.
-- **Verified against upstream's own test suite** (109 passed) plus ~100 fork tests
-  covering the Metal layer, and a benchmark/parity harness
+- **Measured on an M2 Ultra, 128 GB** (5,000 locations × 10,000 genes, full
+  batch, spatial model): CPU 897.5 ms/epoch → **Metal 32.2 ms/epoch (28x)**,
+  with guard-verified CPU/GPU agreement at 2×10⁻⁷ relative. Both figures come
+  from the same protocol in the same session — minimum of three runs after a
+  discarded warm-up, guard off (it cross-checks on the CPU, so timing it
+  measures the verifier) — because a ratio between two differently-measured
+  numbers means nothing. Reproduce with `benchmarks/engine_validation.py`.
+- **Every number here is from one machine.** An M2 Ultra with 128 GB. The Metal
+  path has not been measured on M1, M3 or M4, nor on a low-memory
+  configuration, and CI cannot exercise MPS. Correctness is defended by the
+  numerical guard and the test suite on whatever machine you run; the
+  *performance* figures are a single data point.
+- **Verified by 195 tests** — upstream's own test module plus the fork's
+  Metal-layer contracts, which pin the flat engine's log-joint, ELBO and
+  per-latent gradients against pyro replay — and a benchmark/parity harness
   (`benchmarks/apple_silicon_check.py`) that produces a shareable HTML report.
 
 **Install this fork:**
@@ -34,13 +44,46 @@ pip install git+https://github.com/kevinj24fr/cell2location_metal.git
 Details, escape hatches, and known limits: [docs/apple_silicon.md](docs/apple_silicon.md).
 Everything below describes the cell2location method itself, unchanged from upstream.
 
+### What speed does not change
+
+This fork makes cell2location run faster on Apple silicon. It does not alter
+the model, and it does not make the model's output mean more than it did.
+
+One limit is worth stating here rather than leaving for a reader to discover,
+because a fork advertising speed is someone's entry point to the method. In an
+in-house validation against paired Xenium ground truth (GBM, 55 µm and 25 µm
+bins), cell2location's **point estimates tracked truth well** (r 0.78–0.94 at
+55 µm, 0.86–0.96 at 25 µm) while **credible-interval coverage was
+approximately zero** — absolute density was underestimated roughly two-fold,
+with the panel/chemistry transfer absorbed into the detection prior and
+mean-field intervals far too narrow.
+
+So: relative abundance, rankings, spatial patterns and point-estimate
+co-occurrence are supported. **Absolute cell counts and credible intervals are
+not.** This is a property of the method's mean-field posterior, not something
+this fork introduces or could fix by running faster — it applies equally to
+upstream. Treat the intervals as a diagnostic, not as evidence.
+
 ## Engine changelog (validated)
 
-Every entry here cleared the push gate in `benchmarks/engine_validation.py` before
-merging: measurably faster than what it replaced, final-ELBO parity within 0.5%,
-numerical guard clean, and posterior summaries matching the replaced path within
-Monte-Carlo error. Changes that do not clear the gate do not merge, and are not
-listed.
+Every entry here cleared a push gate before merging: measurably faster than what
+it replaced, final-ELBO parity within 0.5%, numerical guard clean, and posterior
+summaries matching the replaced path within Monte-Carlo error. Changes that do
+not clear the gate do not merge, and are not listed. The gates are
+`benchmarks/engine_validation.py` (spatial model, `--minibatch` for its
+minibatch configuration) and `benchmarks/reference_validation.py` (reference
+signature model); a change touching shared code must pass every arm.
+
+**On the numbers below.** Each entry records what that change measured against
+the baseline current *at the time*, with the harness as it existed then. The
+harness has since been corrected in ways that shift absolute figures without
+changing what any entry demonstrated: timing now excludes the numerical guard
+(which cross-checks on the CPU, so timing it measured the verifier rather than
+training), discards a warm-up run, frees each repeat's model (holding them made
+every later run slower), and reports the minimum of the repeats rather than the
+median (contention only adds time). Each entry's *ratio* stands; its absolute
+ms/epoch is not comparable across entries, nor to what the harness prints
+today. The current baselines are in `benchmarks/*_baseline.json`.
 
 - **Minibatch training for the spatial model.** Passing `batch_size` used to
   drop the spatial model onto the pyro path, so the caller whose data does not
