@@ -33,7 +33,16 @@ from pathlib import Path
 import numpy as np
 import torch
 
-BASELINE = Path(__file__).parent / "engine_baseline.json"
+# ``--minibatch`` gates the spatial model's MINIBATCH configuration, which is a
+# different engine path with different performance characteristics, so it keeps
+# its own baseline. Full batch is the model's default and the arm everything
+# else here describes; a minibatch caller is someone whose data does not fit.
+MINIBATCH = "--minibatch" in sys.argv
+BATCH_SIZE = 1250
+
+BASELINE = Path(__file__).parent / (
+    "engine_minibatch_baseline.json" if MINIBATCH else "engine_baseline.json"
+)
 N_OBS, N_GENES, EPOCHS = 5000, 10000, 30
 
 # Timing is the MEDIAN of REPEATS runs after WARMUP_RUNS discarded ones. One run
@@ -47,7 +56,15 @@ def build():
 
     for name in ("lightning.pytorch", "pytorch_lightning"):
         logging.getLogger(name).setLevel(logging.ERROR)
+    import pyro
     from scvi.data import synthetic_iid
+
+    # pyro's parameter store is process-global. Repeated runs in one process
+    # otherwise let a previous model's guide parameters -- still on the previous
+    # run's device -- be picked up by the next, which surfaces as a mid-forward
+    # "found at least two devices" error rather than as anything resembling its
+    # cause. Each run has to start from an empty store to be independent.
+    pyro.clear_param_store()
 
     import cell2location.accel as accel
     from cell2location.models import Cell2location, RegressionModel
@@ -65,18 +82,39 @@ def build():
     return model, adata
 
 
-def _timed_run():
-    """One build + train + fast export. Returns its metrics and its model/adata,
-    so the parity comparison can be run against the median run specifically."""
-    quiet = {"enable_progress_bar": False, "enable_model_summary": False}
-    model, adata = build()
+QUIET = {"enable_progress_bar": False, "enable_model_summary": False}
+
+
+def _train_kwargs():
+    return {"batch_size": BATCH_SIZE} if MINIBATCH else {}
+
+
+def _guard_run():
+    """One guarded run, for the numerical gate only -- never for timing.
+
+    The guard cross-checks the loss on the CPU. Those CPU forward passes carry
+    most of the wall-clock variance, and the more of them a configuration runs
+    the worse it gets: the minibatch arm fires twelve per run and timing it with
+    the guard on gave a 91% spread across repeats (868.7 / 1480.1 / 774.0).
+    """
+    model, _adata = build()
     model.mps_numerical_guard_every_n_steps = 10
+    model.train(max_epochs=EPOCHS, accelerator="mps", **_train_kwargs(), **QUIET)
+    if model.numerical_guard_ is None:
+        return {"checks": 0, "diverged": True}
+    return model.numerical_guard_.summary()
+
+
+def _timed_run():
+    """One build + train + fast export, guard OFF. Returns its metrics and its
+    model/adata, so parity can be run against the reported run specifically."""
+    quiet = QUIET
+    model, adata = build()
 
     t0 = time.perf_counter()
-    model.train(max_epochs=EPOCHS, accelerator="mps", **quiet)
+    model.train(max_epochs=EPOCHS, accelerator="mps", **_train_kwargs(), **quiet)
     train_ms = (time.perf_counter() - t0) / EPOCHS * 1000
     elbo = float(np.asarray(model.history_["elbo_train"]).ravel()[-1])
-    guard = model.numerical_guard_.summary() if model.numerical_guard_ else {"checks": 0, "diverged": True}
 
     t0 = time.perf_counter()
     out_fast = model.export_posterior(adata, sample_kwargs={"num_samples": 1000, "batch_size": adata.n_obs})
@@ -86,8 +124,8 @@ def _timed_run():
     return {
         "train_ms_per_epoch": train_ms,
         "final_elbo": elbo,
-        "guard": guard,
         "export_seconds": export_s,
+        "flat_engine_used": bool(getattr(model, "flat_engine_used_", False)),
     }, model, adata, fast
 
 
@@ -161,10 +199,15 @@ def main():
     runs = [(t,) for t in timings]
     key = next(k for k in fast if k.startswith("means"))
 
+    # Parity first: it exports from the kept model, whose guide parameters live
+    # in pyro's global store. _guard_run builds another model and clears that
+    # store, which would pull the kept model's parameters out from under it.
     metrics["export_parity_median_rel"] = _parity(model, adata, fast)
+    metrics["guard"] = _guard_run()
     metrics["train_ms_all_runs"] = [round(r[0]["train_ms_per_epoch"], 1) for r in runs]
     metrics["export_seconds_all_runs"] = [round(r[0]["export_seconds"], 2) for r in runs]
     metrics["repeats"] = REPEATS
+    metrics["minibatch"] = BATCH_SIZE if MINIBATCH else None
     print(json.dumps(metrics, indent=2, default=str))
     parity = metrics["export_parity_median_rel"]
     train_ms = metrics["train_ms_per_epoch"]

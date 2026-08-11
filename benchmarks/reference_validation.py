@@ -56,7 +56,13 @@ def build():
 
     for name in ("lightning.pytorch", "pytorch_lightning"):
         logging.getLogger(name).setLevel(logging.ERROR)
+    import pyro
     from scvi.data import synthetic_iid
+
+    # pyro's parameter store is process-global; repeated runs in one process
+    # must not inherit the previous run's guide parameters (which are also on
+    # the previous run's device). See the note in engine_validation.build.
+    pyro.clear_param_store()
 
     import cell2location.accel as accel
     from cell2location.models import RegressionModel

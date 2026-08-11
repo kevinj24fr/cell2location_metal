@@ -1,6 +1,16 @@
 {
-  "train_ms_per_epoch": 73.05516806275894,
-  "final_elbo": 210174976.0,
+  "train_ms_per_epoch": 32.4931791673104,
+  "final_elbo": 210205952.0,
+  "export_seconds": 11.298611792037264,
+  "flat_engine_used": true,
+  "export_parity_median_rel": {
+    "accessibility": 0.0,
+    "protein_expression": 0.0,
+    "means_cell_abundance_w_sf": 0.003029743442311883,
+    "stds_cell_abundance_w_sf": 0.022143250331282616,
+    "q05_cell_abundance_w_sf": 0.006246013566851616,
+    "q95_cell_abundance_w_sf": 0.0062284283339977264
+  },
   "guard": {
     "checks": 3,
     "diverged": false,
@@ -8,24 +18,16 @@
     "mean_relative_difference": 1.7621116686130107e-07,
     "tolerance": 0.001
   },
-  "export_seconds": 10.836131291929632,
-  "export_parity_median_rel": {
-    "accessibility": 0.0,
-    "protein_expression": 0.0,
-    "means_cell_abundance_w_sf": 0.00302780419588089,
-    "stds_cell_abundance_w_sf": 0.02213972806930542,
-    "q05_cell_abundance_w_sf": 0.006247745826840401,
-    "q95_cell_abundance_w_sf": 0.00622658571228385
-  },
   "train_ms_all_runs": [
-    73.1,
-    72.0,
-    73.4
+    32.0,
+    32.5,
+    32.5
   ],
   "export_seconds_all_runs": [
-    11.22,
-    10.69,
-    10.84
+    11.36,
+    11.3,
+    11.13
   ],
-  "repeats": 3
+  "repeats": 3,
+  "minibatch": null
 }
