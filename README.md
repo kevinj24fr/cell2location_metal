@@ -42,6 +42,29 @@ numerical guard clean, and posterior summaries matching the replaced path within
 Monte-Carlo error. Changes that do not clear the gate do not merge, and are not
 listed.
 
+- **Flat training engine.** Training no longer runs through pyro's effect
+  handlers: all 17 sites' log-densities and the GammaPoisson likelihood are
+  hand-transcribed tensor code, the mean-field guide lives in two flat tensors
+  (unconstrained loc, softplus-unconstrained scale), and each step draws one
+  reparameterized sample and optimizes −(log-joint − log q) with unclipped
+  Adam — matching what the pyro path actually uses (its ClippedAdam docstring
+  is stale; an elementwise clamp tried first destabilized long runs with a
+  measured ~2-posterior-sd abundance shift and was removed on that artifact).
+  Transcription, ELBO and per-draw gradients are contract-pinned against pyro
+  replay; the numerical guard runs natively (same-latents flat log-joint, MPS
+  vs CPU). Validation harness at 5,000×10,000 (M2 Ultra): training 274.9 →
+  117.9 ms/epoch (**2.33x**), final-ELBO parity, guard clean (worst CPU/GPU
+  difference 7.6e-8), export parity unchanged. Same-data trajectory comparison
+  against the pyro path at convergence, early stopping active: final-loss
+  parity 1.2e-6 by tail median (the tail mean is one heavy-tail single-draw
+  outlier — ~1 in 700 epochs, both engines' estimator family — away from
+  meaningless), abundance r 0.992 with **100% of values within 1 posterior
+  standard deviation** (median drift 0.08 sd), **2.3x wall-clock**. Scope:
+  full-batch MPS training with the default AutoNormal guide; minibatch, custom
+  optimizers/callbacks, loaded-model warmups and other unhandled arguments fall
+  back to the pyro path automatically. Kill switch
+  `CELL2LOCATION_MPS_FLAT_ENGINE=0`.
+
 - **Convergence-based early stopping (Metal runs).** Upstream trains a fixed
   30,000 epochs with no stopping criterion; the ELBO plateaus long before that and
   the remainder is a random walk on a flat objective. Training now stops when the

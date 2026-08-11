@@ -58,7 +58,7 @@ def _sample_values_to_from_dict(latents):
 
     trace = Trace()
     for name, value in latents.items():
-        trace.add_node(name, type="sample", value=value, is_observed=False)
+        trace.add_node(name, type="sample", value=value, is_observed=False, infer={})
     return trace
 
 
