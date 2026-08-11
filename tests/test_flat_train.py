@@ -196,10 +196,35 @@ def test_kill_switch_falls_back_to_pyro(monkeypatch):
 
 
 @pytest.mark.skipif(not mps_available, reason="flat engine is the Metal path")
-def test_minibatch_falls_back_to_pyro():
+def test_minibatch_runs_on_the_flat_engine():
+    """Was a fallback contract while spatial minibatch was unimplemented. The
+    engine now subsamples the observation plate -- local latents included -- and
+    the arithmetic is pinned against pyro replay in test_flat_joint_minibatch.py.
+    A spatial minibatch caller therefore stays on the flat engine."""
     model = _make_model(seed=3)
     model.train(max_epochs=2, batch_size=50, enable_progress_bar=False, enable_model_summary=False)
-    assert model.flat_engine_used_ is False
+    assert model.flat_engine_used_ is True
+    assert model.is_trained_ is True
+
+
+@pytest.mark.skipif(not mps_available, reason="flat engine is the Metal path")
+def test_minibatch_falls_back_when_a_local_site_is_not_row_indexed():
+    """Subsampling local latents means indexing their guide parameters by
+    observation. A site declared per-observation whose parameter is not shaped
+    that way would be silently mis-indexed, so it must route to pyro instead."""
+    model = _make_model(seed=3)
+    pyro_model = getattr(model.module.model, "_orig_mod", model.module.model)
+    original = pyro_model.list_obs_plate_vars
+    try:
+        pyro_model.list_obs_plate_vars = lambda: {
+            "name": "obs_plate", "input": [], "sites": {"m_g": 1},  # m_g is per-GENE
+        }
+        model.train(max_epochs=2, batch_size=50, enable_progress_bar=False,
+                    enable_model_summary=False)
+        assert model.flat_engine_used_ is False
+        assert model.is_trained_ is True
+    finally:
+        pyro_model.list_obs_plate_vars = original
 
 
 @pytest.mark.skipif(not mps_available, reason="flat engine is the Metal path")

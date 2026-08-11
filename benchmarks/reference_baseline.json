@@ -1,5 +1,5 @@
 {
-  "train_ms_per_epoch": 51.490988869530455,
+  "train_ms_per_epoch": 49.28264719589303,
   "final_elbo": 393715328.0,
   "flat_engine_used": true,
   "guard": {
@@ -10,9 +10,9 @@
     "tolerance": 0.001
   },
   "train_ms_all_runs": [
-    51.4,
-    51.5,
-    52.0
+    86.8,
+    49.8,
+    49.3
   ],
   "config": {
     "n_obs": 10000,

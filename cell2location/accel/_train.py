@@ -37,13 +37,38 @@ _FLAT_EQUIVALENT_CALLBACKS = frozenset(
 )
 
 
-def _supports_minibatch(module) -> bool:
-    """True when a minibatch step only has to scale the likelihood.
+def _warm_up_guide(model, kwargs) -> None:
+    """Run the guide once so AutoNormal materializes its parameters.
 
-    That holds exactly when the model declares no per-observation latent sites:
-    everything in the guide is global, so the data subsamples and the guide does
-    not. Read from the model's own ``list_obs_plate_vars`` rather than a class
-    list, so a model that grows a local site stops qualifying on its own.
+    Their shapes are what decides whether local sites can be row-indexed, and
+    AutoNormal builds them lazily on first call. A failure here is not fatal --
+    the caller's shape check simply finds nothing and routes to pyro.
+    """
+    import torch
+
+    from ._device import resolve_accelerator
+    from ._flat_train import _full_batch_args
+
+    try:
+        _, device = resolve_accelerator(kwargs.get("accelerator", "auto"), kwargs.get("device", "auto"))
+        model.module.to(device)
+        args, batch_kwargs = _full_batch_args(model, device)
+        with torch.no_grad():
+            model.module.guide(*args, **batch_kwargs)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Flat engine: guide warm-up failed (%s).", exc)
+
+
+def _supports_minibatch(module, n_obs=None) -> bool:
+    """True when the engine can subsample this model's observation plate.
+
+    Two cases, both driven by the model's own ``list_obs_plate_vars`` rather
+    than a class list. With no per-observation latent sites the guide is global
+    and only the data subsamples. With local sites, they are subsampled with the
+    data -- which requires each one's guide parameter to be indexed by
+    observation, i.e. to have n_obs as its leading dimension. That is checked
+    against the guide rather than assumed, because a site whose leading axis
+    means something else would be silently mis-indexed.
     """
     mod = getattr(module, "model", None)
     mod = getattr(mod, "_orig_mod", mod)
@@ -51,9 +76,32 @@ def _supports_minibatch(module) -> bool:
     if lister is None:
         return False
     try:
-        return not lister()["sites"]
+        sites = lister()["sites"]
     except Exception:  # noqa: BLE001 - an unreadable declaration is not a green light
         return False
+    if not sites:
+        return True
+    if n_obs is None:
+        return False
+
+    from ._sampling import _autonormal_site_params
+
+    guide = getattr(module, "guide", None)
+    if guide is None:
+        return False
+    try:
+        shapes = {name: tuple(loc.shape) for name, loc, _s, _t in _autonormal_site_params(guide)}
+    except Exception:  # noqa: BLE001
+        return False
+    for name in sites:
+        shape = shapes.get(name)
+        if shape is None or not shape or shape[0] != n_obs:
+            logger.info(
+                "Flat engine: site %r is declared per-observation but its guide "
+                "parameter has shape %s; training through pyro.", name, shape
+            )
+            return False
+    return True
 
 
 def _guard_interval_from_env() -> int:
@@ -184,13 +232,14 @@ class AppleSiliconTrainMixin:
             return False
         if kwargs.get("train_size", 1) != 1:
             return False
-        # Minibatch is implemented only where every latent is global (the reference
-        # model). The spatial model has five per-location latents, which a minibatch
-        # step would have to subsample in lockstep with the data -- not built, so a
-        # spatial caller passing batch_size still goes to pyro.
         minibatch = kwargs.get("batch_size") is not None
-        if minibatch and not _supports_minibatch(self.module):
-            return False
+        if minibatch:
+            n_obs = getattr(getattr(self, "adata", None), "n_obs", None)
+            # The guide must exist before its local sites can be shape-checked.
+            if getattr(self.module.guide, "prototype_trace", None) is None:
+                _warm_up_guide(self, kwargs)
+            if not _supports_minibatch(self.module, n_obs):
+                return False
         callbacks = kwargs.get("callbacks") or []
         if any(type(cb).__name__ not in _FLAT_EQUIVALENT_CALLBACKS for cb in callbacks):
             # A callback the flat engine cannot reproduce needs the Lightning loop.

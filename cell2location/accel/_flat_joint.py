@@ -164,8 +164,16 @@ _SPATIAL_MODEL = (
 )
 
 
-def flat_log_joint(module, args, kwargs, latents):
-    """log p(latents, data) for the spatial model, matching pyro replay exactly."""
+def flat_log_joint(module, args, kwargs, latents, plate_scale=1.0):
+    """log p(latents, data) for the spatial model, matching pyro replay exactly.
+
+    ``plate_scale`` is the observation plate's n_obs/batch factor. pyro applies
+    it to everything inside the plate, which here is five per-location latents'
+    priors AND the likelihood -- not the likelihood alone, as it is for the
+    reference model whose latents are all global. Terms are accumulated in two
+    running sums so the scale multiplies exactly the local block. At the default
+    1.0 this is the full-batch expression the contract pins against pyro replay.
+    """
     del kwargs
     x_data, idx, batch_index = args
     mod = module.model
@@ -177,7 +185,8 @@ def flat_log_joint(module, args, kwargs, latents):
     ).to(x_data.dtype)
     ones = mod.ones
 
-    lp = x_data.new_zeros(())
+    lp = x_data.new_zeros(())        # global sites
+    local = x_data.new_zeros(())     # sites inside the observation plate
 
     # --- gene technology scaling m_g ---
     lp = lp + _gamma_lp(
@@ -190,16 +199,16 @@ def flat_log_joint(module, args, kwargs, latents):
     lp = lp + _gamma_lp(L["m_g"], m_g_alpha_e, m_g_alpha_e / L["m_g_mean"])
 
     # --- cells and groups per location ---
-    lp = lp + _gamma_lp(
+    local = local + _gamma_lp(
         L["n_s_cells_per_location"],
         mod.N_cells_per_location * mod.N_cells_mean_var_ratio,
         mod.N_cells_mean_var_ratio,
     )
-    lp = lp + _gamma_lp(L["b_s_groups_per_location"], mod.B_groups_per_location, ones)
+    local = local + _gamma_lp(L["b_s_groups_per_location"], mod.B_groups_per_location, ones)
 
     shape = mod.ones_1_n_groups * L["b_s_groups_per_location"] / mod.n_groups_tensor
     rate = mod.ones_1_n_groups / (L["n_s_cells_per_location"] / L["b_s_groups_per_location"])
-    lp = lp + _gamma_lp(L["z_sr_groups_factors"], shape, rate)
+    local = local + _gamma_lp(L["z_sr_groups_factors"], shape, rate)
 
     lp = lp + _gamma_lp(L["k_r_factors_per_groups"], mod.factors_per_groups, ones)
     lp = lp + _gamma_lp(
@@ -209,7 +218,7 @@ def flat_log_joint(module, args, kwargs, latents):
     )
 
     w_sf_mu = L["z_sr_groups_factors"] @ L["x_fr_group2fact"]
-    lp = lp + _gamma_lp(
+    local = local + _gamma_lp(
         L["w_sf"], w_sf_mu * mod.w_sf_mean_var_ratio_tensor, mod.w_sf_mean_var_ratio_tensor
     )
 
@@ -221,7 +230,7 @@ def flat_log_joint(module, args, kwargs, latents):
     )
     detection_hyp_prior_alpha = mod.ones_n_batch_1 * mod.detection_hyp_prior_alpha
     alpha_s = obs2sample @ detection_hyp_prior_alpha
-    lp = lp + _gamma_lp(
+    local = local + _gamma_lp(
         L["detection_y_s"], alpha_s, alpha_s / (obs2sample @ L["detection_mean_y_e"])
     )
 
@@ -251,6 +260,6 @@ def flat_log_joint(module, args, kwargs, latents):
         "detection_y_s"
     ]
     alpha = obs2sample @ (ones / L["alpha_g_inverse"].pow(2))
-    lp = lp + _nb_lp(x_data, mu, alpha)
+    local = local + _nb_lp(x_data, mu, alpha)
 
-    return lp
+    return lp + plate_scale * local
