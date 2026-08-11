@@ -1,0 +1,33 @@
+{
+  "train_ms_per_epoch": 482.05606526850414,
+  "final_elbo": 198227488.0,
+  "export_seconds": 11.005856083938852,
+  "flat_engine_used": false,
+  "export_parity_median_rel": {
+    "accessibility": 0.0,
+    "protein_expression": 0.0,
+    "means_cell_abundance_w_sf": 0.002957276999950409,
+    "stds_cell_abundance_w_sf": 0.021908588707447052,
+    "q05_cell_abundance_w_sf": 0.006189603358507156,
+    "q95_cell_abundance_w_sf": 0.006198683753609657
+  },
+  "guard": {
+    "checks": 12,
+    "diverged": false,
+    "max_relative_difference": 2.4031829677771615e-07,
+    "mean_relative_difference": 1.3053293067667605e-07,
+    "tolerance": 0.001
+  },
+  "train_ms_all_runs": [
+    482.1,
+    479.1,
+    521.3
+  ],
+  "export_seconds_all_runs": [
+    11.01,
+    10.97,
+    11.31
+  ],
+  "repeats": 3,
+  "minibatch": 1250
+}
