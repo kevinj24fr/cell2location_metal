@@ -130,6 +130,36 @@ def test_flat_log_q_from_state_matches_per_site(warmed_model):
     assert abs(result - reference) <= 1e-4 * abs(reference)
 
 
+def test_packed_model_proxy_matches_module(warmed_model):
+    """Buffer packing (one tensor for all small hyperparameter buffers, lazily
+    sliced inside the loss so a compiled graph reads one buffer, not 21 -- Metal
+    caps kernels at 31 constant buffers) must be loss- and gradient-identical to
+    reading the module's buffers directly."""
+    args, kwargs = _batch(warmed_model)
+    state = flat_train.FlatGuideState.from_guide(warmed_model.module.guide)
+    torch.manual_seed(11)
+    eps = torch.randn_like(state.loc)
+
+    packed = flat_train.pack_module(warmed_model.module)
+    loss_p = flat_train.flat_training_loss(packed, state, args, kwargs, eps)
+    grads_p = torch.autograd.grad(loss_p, [state.loc, state.rho])
+
+    loss_m = flat_train.flat_training_loss(warmed_model.module, state, args, kwargs, eps)
+    grads_m = torch.autograd.grad(loss_m, [state.loc, state.rho])
+
+    assert abs(float(loss_p) - float(loss_m)) <= 1e-6 * abs(float(loss_m))
+    for gp, gm in zip(grads_p, grads_m):
+        assert (gp - gm).abs().max() <= 1e-6 * gm.abs().max().clamp_min(1e-6)
+    # the packing invariant itself: every packed attribute views one storage
+    ptrs = {
+        packed.model.m_g_mu_hyp.untyped_storage().data_ptr(),
+        packed.model.ones.untyped_storage().data_ptr(),
+        packed.model.alpha_g_phi_hyp_prior_beta.untyped_storage().data_ptr(),
+        packed.model.ones_1_n_groups.untyped_storage().data_ptr(),
+    }
+    assert len(ptrs) == 1
+
+
 # --- model.train() wiring ---
 
 
