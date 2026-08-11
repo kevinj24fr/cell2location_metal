@@ -34,6 +34,13 @@ BASELINE = Path(__file__).parent / "reference_baseline.json"
 # run still finishes in seconds. Genes match the spatial harness.
 N_OBS, N_GENES, EPOCHS, BATCH = 10000, 10000, 30, 2500
 
+# Timing is the MEDIAN of this many independent training runs. One run is not
+# enough: a single-run measurement of this workload was observed at 364 ms/epoch
+# against a 130 ms median on the same code, which is far more than the 5% the
+# gate is trying to resolve. The median run's ELBO and guard are the ones
+# reported, so every reported number comes from the same run.
+REPEATS = 3
+
 
 def build():
     import logging
@@ -53,9 +60,9 @@ def build():
     return RegressionModel(adata), adata
 
 
-def main():
+def _one_run():
     quiet = {"enable_progress_bar": False, "enable_model_summary": False}
-    model, adata = build()
+    model, _adata = build()
     model.mps_numerical_guard_every_n_steps = 10
 
     t0 = time.perf_counter()
@@ -63,13 +70,22 @@ def main():
     train_ms = (time.perf_counter() - t0) / EPOCHS * 1000
     elbo = float(np.asarray(model.history_["elbo_train"]).ravel()[-1])
     guard = model.numerical_guard_.summary() if model.numerical_guard_ else {"checks": 0, "diverged": True}
-
-    metrics = {
+    return {
         "train_ms_per_epoch": train_ms,
         "final_elbo": elbo,
         "guard": guard,
         "flat_engine_used": bool(getattr(model, "flat_engine_used_", False)),
-        "config": {"n_obs": N_OBS, "n_genes": N_GENES, "epochs": EPOCHS, "batch_size": BATCH},
+    }
+
+
+def main():
+    runs = [_one_run() for _ in range(REPEATS)]
+    runs.sort(key=lambda r: r["train_ms_per_epoch"])
+    metrics = dict(runs[len(runs) // 2])  # the median run, reported whole
+    metrics["train_ms_all_runs"] = [round(r["train_ms_per_epoch"], 1) for r in runs]
+    metrics["config"] = {
+        "n_obs": N_OBS, "n_genes": N_GENES, "epochs": EPOCHS,
+        "batch_size": BATCH, "repeats": REPEATS,
     }
     print(json.dumps(metrics, indent=2, default=str))
 
@@ -80,6 +96,9 @@ def main():
         return 2
 
     base = json.loads(BASELINE.read_text())
+    train_ms = metrics["train_ms_per_epoch"]
+    elbo = metrics["final_elbo"]
+    guard = metrics["guard"]
     checks = {
         "train_faster": train_ms <= base["train_ms_per_epoch"] * 0.95,
         "elbo_parity": abs(elbo - base["final_elbo"]) / abs(base["final_elbo"]) <= 0.005,
