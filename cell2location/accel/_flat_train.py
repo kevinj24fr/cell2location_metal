@@ -461,6 +461,29 @@ def _to_device(args, device):
     return tuple(a.to(device) if torch.is_tensor(a) else a for a in args)
 
 
+def _resolve_max_epochs(model, kwargs) -> int:
+    """The epoch count, resolving ``None`` exactly as the pyro path would.
+
+    ``RegressionModel.train`` documents ``max_epochs=None`` as "use the
+    heuristic", and passes the None straight through, so the key is PRESENT with
+    a None value -- ``kwargs.get("max_epochs", default)`` returns None, not the
+    default. Every synthetic benchmark and test passes an explicit count, so this
+    only ever surfaced on a real call.
+
+    Deferring to scvi's own ``get_max_epochs_heuristic`` rather than
+    re-implementing it keeps the flat engine training for the same number of
+    epochs as the path it replaces, including if scvi changes the heuristic.
+    """
+    max_epochs = kwargs.get("max_epochs")
+    if max_epochs is not None:
+        return int(max_epochs)
+    from scvi.model._utils import get_max_epochs_heuristic
+
+    resolved = get_max_epochs_heuristic(model.adata.n_obs, epochs_cap=1000)
+    logger.info("Flat engine: max_epochs=None resolved to %d by scvi's heuristic.", resolved)
+    return int(resolved)
+
+
 def run_flat_minibatch_training(model, kwargs, log_joint_fn) -> bool:
     """Minibatch flat training. Serves both models through one path.
 
@@ -513,7 +536,7 @@ def run_flat_minibatch_training(model, kwargs, log_joint_fn) -> bool:
     packed = pack_module(module)
     lr = kwargs.get("lr", 0.002)
     optimizer = _make_optimizer(state, lr)
-    max_epochs = kwargs.get("max_epochs", 30000)
+    max_epochs = _resolve_max_epochs(model, kwargs)
     logger.info(
         "Flat engine (minibatch, %s data): training %s up to %d epochs "
         "(%d parameters, batch_size=%d, lr=%g).",
@@ -613,7 +636,7 @@ def run_flat_training(model, kwargs, log_joint_fn=None) -> bool:
     state = FlatGuideState.from_guide(guide)
     packed = pack_module(module)
     optimizer = _make_optimizer(state, kwargs.get("lr", 0.002))
-    max_epochs = kwargs.get("max_epochs", 30000)
+    max_epochs = _resolve_max_epochs(model, kwargs)
     logger.info(
         "Flat engine: training %s up to %d epochs (%d parameters, lr=%g).",
         type(getattr(module, "model", module)).__name__, max_epochs, state.loc.numel(), kwargs.get("lr", 0.002),
