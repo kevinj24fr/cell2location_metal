@@ -159,6 +159,8 @@ class RegressionModel(
 
         self._prepare_apple_silicon(kwargs)
 
+        if self._flat_train_if_applicable(kwargs):
+            return
         super().train(**kwargs)
 
     def _compute_cluster_averages(self, key=REGISTRY_KEYS.LABELS_KEY):

@@ -140,10 +140,22 @@ def log_joint_for(module):
     mod = getattr(mod, "_orig_mod", mod)  # unwrap torch.compile
     name = type(mod).__name__
     if name == _SPATIAL_MODEL:
-        return flat_log_joint
+        return flat_log_joint if _spatial_supports(mod) else None
     if _reference_supports(mod):
         return reference_log_joint
     return None
+
+
+def _spatial_supports(mod) -> bool:
+    """Scope of the spatial transcription below.
+
+    Excludes models carrying initial values: the spatial ``forward`` emits extra
+    ``*_initial`` Gamma terms built from its ``init_val_*`` buffers, which this
+    transcription does not carry. (The reference model registers the same buffers
+    but never reads them in ``forward`` -- there they only initialize the guide --
+    so that model is not excluded on these grounds.)
+    """
+    return getattr(mod, "np_init_vals", None) is None
 
 
 #: The pyro model ``flat_log_joint`` below transcribes, by class name.

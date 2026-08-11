@@ -37,6 +37,25 @@ _FLAT_EQUIVALENT_CALLBACKS = frozenset(
 )
 
 
+def _supports_minibatch(module) -> bool:
+    """True when a minibatch step only has to scale the likelihood.
+
+    That holds exactly when the model declares no per-observation latent sites:
+    everything in the guide is global, so the data subsamples and the guide does
+    not. Read from the model's own ``list_obs_plate_vars`` rather than a class
+    list, so a model that grows a local site stops qualifying on its own.
+    """
+    mod = getattr(module, "model", None)
+    mod = getattr(mod, "_orig_mod", mod)
+    lister = getattr(mod, "list_obs_plate_vars", None)
+    if lister is None:
+        return False
+    try:
+        return not lister()["sites"]
+    except Exception:  # noqa: BLE001 - an unreadable declaration is not a green light
+        return False
+
+
 def _guard_interval_from_env() -> int:
     raw = os.environ.get(GUARD_ENV_VAR, "0").strip().lower()
     if raw in ("", "0", "false", "no"):
@@ -140,11 +159,17 @@ class AppleSiliconTrainMixin:
         optimizer, an AutoNormal guide, no dropout, no initial-value branches. Any
         miss -- including a divergence mid-run -- leaves training to the pyro path.
         """
-        from ._flat_train import FLAT_ENGINE_ENV_VAR, run_flat_training
+        from ._flat_joint import log_joint_for
+        from ._flat_train import FLAT_ENGINE_ENV_VAR, run_flat_minibatch_training, run_flat_training
         from ._sampling import NotVectorizable
 
         self.flat_engine_used_ = False
         if os.environ.get(FLAT_ENGINE_ENV_VAR, "1").strip().lower() in ("0", "false", "no"):
+            return False
+        # Resolve the transcription by model type first: this mixin is shared, and
+        # a model with no transcription (or one out of its scope) belongs on pyro.
+        log_joint_fn = log_joint_for(self.module)
+        if log_joint_fn is None:
             return False
         # Any train kwarg the flat engine does not implement routes to pyro rather
         # than being silently ignored. scvi's load() warmup depends on this: it
@@ -157,7 +182,14 @@ class AppleSiliconTrainMixin:
         _, device = resolve_accelerator(kwargs.get("accelerator", "auto"), kwargs.get("device", "auto"))
         if device.type != "mps":
             return False
-        if kwargs.get("batch_size") is not None or kwargs.get("train_size", 1) != 1:
+        if kwargs.get("train_size", 1) != 1:
+            return False
+        # Minibatch is implemented only where every latent is global (the reference
+        # model). The spatial model has five per-location latents, which a minibatch
+        # step would have to subsample in lockstep with the data -- not built, so a
+        # spatial caller passing batch_size still goes to pyro.
+        minibatch = kwargs.get("batch_size") is not None
+        if minibatch and not _supports_minibatch(self.module):
             return False
         callbacks = kwargs.get("callbacks") or []
         if any(type(cb).__name__ not in _FLAT_EQUIVALENT_CALLBACKS for cb in callbacks):
@@ -171,15 +203,19 @@ class AppleSiliconTrainMixin:
             return False
         if plan.get("scale_elbo", 1.0) != 1.0 or "optim" in plan or "optim_kwargs" in plan:
             return False
+        # Initial-value scope is per-transcription and lives in log_joint_for: the
+        # spatial forward turns init_val_* buffers into extra density terms, the
+        # reference forward never reads them.
         pyro_model = getattr(self.module, "model", None)
-        if getattr(pyro_model, "np_init_vals", None) is not None:
-            return False
         if getattr(pyro_model, "dropout_p", 0.0):
             return False
         if getattr(pyro_model, "training_wo_observed", False):
             return False
         try:
-            self.flat_engine_used_ = run_flat_training(self, kwargs)
+            if minibatch:
+                self.flat_engine_used_ = run_flat_minibatch_training(self, kwargs, log_joint_fn)
+            else:
+                self.flat_engine_used_ = run_flat_training(self, kwargs, log_joint_fn)
         except NotVectorizable as exc:
             logger.info("Flat engine unavailable (%s); training through pyro.", exc)
             return False

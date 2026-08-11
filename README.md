@@ -42,6 +42,28 @@ numerical guard clean, and posterior summaries matching the replaced path within
 Monte-Carlo error. Changes that do not clear the gate do not merge, and are not
 listed.
 
+- **Flat engine for the reference signature model, with minibatches.** Every
+  number below this entry describes the spatial model. The reference model --
+  step 1 of every workflow, where per-cluster expression signatures are
+  estimated -- trained through pyro regardless, so half the pipeline saw none of
+  it. It now runs on the flat engine, and unlike the spatial engine it
+  minibatches, which it must: `RegressionModel` defaults to `batch_size=2500`
+  because real references are large. That is possible here because this model
+  declares no per-observation latent sites — all nine of its latents are
+  global — so a minibatch step subsamples the data and scales the likelihood by
+  `n_obs/batch`, rather than having to subsample the guide in lockstep (the
+  spatial model has five per-location latents and stays full-batch; a spatial
+  caller passing `batch_size` still routes to pyro). Batches come from scvi's
+  own loader rather than a device-resident copy of the matrix, since a caller
+  who asked for minibatching may have done so because the data does not fit.
+  Measured at 10,000 cells × 10,000 genes, `batch_size=2500` (M2 Ultra):
+  **569.6 → 194.4 ms/epoch (2.93x)**, final-ELBO parity within 0.15%, guard
+  clean (12 checks, worst GPU/CPU difference 2.4e-7). The spatial harness was
+  re-run unchanged on the same commit and still passes every gate. Contracts:
+  the transcription is pinned against pyro replay for value and per-latent
+  gradients at three batch sizes, so the plate scale cannot silently drift.
+  Kill switch `CELL2LOCATION_MPS_FLAT_ENGINE=0`, shared with the spatial engine.
+
 - **Flat likelihood through the fused NB kernel.** The flat engine's data
   likelihood — its single biggest term — now routes through the same
   self-verifying Metal kernel the pyro path uses (GammaPoisson(α, α/μ) ≡
