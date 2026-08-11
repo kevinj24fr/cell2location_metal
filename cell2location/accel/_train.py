@@ -29,9 +29,12 @@ _FLAT_HANDLED_TRAIN_KWARGS = frozenset(
     }
 )
 
-#: Callbacks whose behavior the flat engine reproduces itself (early stopping) or
-#: that a full-batch flat run does not need (periodic MPS cache release).
-_FLAT_EQUIVALENT_CALLBACKS = frozenset({"_MPSCacheCallback", "_RelativeEarlyStoppingCallback"})
+#: Callbacks whose behavior the flat engine reproduces itself (early stopping, the
+#: numerical guard as a same-latents flat_log_joint MPS-vs-CPU comparison) or that
+#: a full-batch flat run does not need (periodic MPS cache release).
+_FLAT_EQUIVALENT_CALLBACKS = frozenset(
+    {"_MPSCacheCallback", "_RelativeEarlyStoppingCallback", "_NumericalGuardCallback"}
+)
 
 
 def _guard_interval_from_env() -> int:
@@ -158,8 +161,7 @@ class AppleSiliconTrainMixin:
             return False
         callbacks = kwargs.get("callbacks") or []
         if any(type(cb).__name__ not in _FLAT_EQUIVALENT_CALLBACKS for cb in callbacks):
-            # Unrecognized callbacks (including the replay-based numerical guard,
-            # which has no flat equivalent yet) need the Lightning loop.
+            # A callback the flat engine cannot reproduce needs the Lightning loop.
             return False
         plan = kwargs.get("plan_kwargs") or {}
         loss_fn = plan.get("loss_fn")

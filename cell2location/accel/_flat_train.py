@@ -121,6 +121,53 @@ def flat_training_loss(module, state, args, kwargs, eps):
     return -(log_joint - flat_log_q_from_state(state.loc, scale_flat, u_flat, state))
 
 
+def _flat_guard_check(guard, module, state, args, kwargs, epoch):
+    """One guard comparison: flat_log_joint at the same fresh draw on the training
+    device and on CPU. Identical latents make it deterministic -- any disagreement
+    is device arithmetic, and it is exactly the arithmetic the flat engine trains
+    on (the pyro-path guard compares the replayed model log-joint instead)."""
+    with torch.no_grad():
+        u_flat = state.loc + torch.nn.functional.softplus(state.rho) * torch.randn_like(state.loc)
+        latents = state.constrain(u_flat)
+        try:
+            device_loss = float(flat_log_joint(module, args, kwargs, latents))
+        except Exception as exc:  # noqa: BLE001 - a failed check must not kill training
+            logger.debug("Flat guard: device evaluation failed (%s).", exc)
+            return None
+        original_device = state.loc.device
+        try:
+            cpu_latents = {name: value.detach().cpu() for name, value in latents.items()}
+            cpu_args = tuple(a.cpu() if torch.is_tensor(a) else a for a in args)
+            module.to("cpu")
+            try:
+                reference_loss = float(flat_log_joint(module, cpu_args, kwargs, cpu_latents))
+            finally:
+                module.to(original_device)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Flat guard: CPU evaluation failed (%s).", exc)
+            return None
+
+    scale = max(abs(reference_loss), 1e-12)
+    relative_difference = abs(device_loss - reference_loss) / scale
+    if not math.isfinite(relative_difference):
+        # Non-finite must read as divergence, never as agreement.
+        relative_difference = float("inf")
+    record = {
+        "step": epoch,
+        "device_loss": device_loss,
+        "reference_loss": reference_loss,
+        "relative_difference": relative_difference,
+    }
+    guard.history.append(record)
+    if relative_difference > guard.tolerance:
+        logger.warning(
+            "Numerical guard (flat engine): epoch %d log-joint differs by %.3g between "
+            "the GPU and CPU (%.6g vs %.6g, tolerance %.3g).",
+            epoch, relative_difference, device_loss, reference_loss, guard.tolerance,
+        )
+    return record
+
+
 def _full_batch_args(model, device):
     from scvi.dataloaders import AnnDataLoader
 
@@ -157,6 +204,10 @@ def run_flat_training(model, kwargs) -> bool:
         "Flat engine: training %s up to %d epochs (%d parameters, lr=%g).",
         type(getattr(module, "model", module)).__name__, max_epochs, state.loc.numel(), kwargs.get("lr", 0.002),
     )
+
+    guard = None
+    if any(type(cb).__name__ == "_NumericalGuardCallback" for cb in kwargs.get("callbacks") or []):
+        guard = getattr(model, "numerical_guard_", None)
 
     stopper = None
     stop_cfg = getattr(model, "mps_early_stopping", None)
@@ -196,6 +247,9 @@ def run_flat_training(model, kwargs) -> bool:
         state.rho.grad.clamp_(-_GRAD_CLAMP, _GRAD_CLAMP)
         optimizer.step()
         losses.append(loss_value)
+
+        if guard is not None and guard.every_n_steps and epoch % guard.every_n_steps == 0:
+            _flat_guard_check(guard, module, state, args, batch_kwargs, epoch)
 
         if stopper is not None:
             shim = SimpleNamespace(

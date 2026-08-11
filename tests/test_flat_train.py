@@ -188,15 +188,20 @@ def test_unknown_train_kwargs_fall_back_to_pyro(tmp_path):
 
 
 @pytest.mark.skipif(not mps_available, reason="flat engine is the Metal path")
-def test_numerical_guard_request_falls_back_to_pyro():
-    """The divergence guard is replay-based on the pyro path; the flat engine has no
-    equivalent yet, so a guarded run must not silently lose its guard."""
+def test_numerical_guard_runs_on_flat_engine():
+    """A guarded run must stay guarded on the flat engine: the harness's guard_clean
+    gate requires checks > 0, not diverged, finite max relative difference. The flat
+    guard compares flat_log_joint at the current draw on MPS vs CPU -- the actual
+    training arithmetic, same latents, so any disagreement is device arithmetic."""
     model = _make_model(seed=6)
     model.mps_flat_compile = False
-    model.mps_numerical_guard_every_n_steps = 1
-    model.train(max_epochs=2, enable_progress_bar=False, enable_model_summary=False)
-    assert model.flat_engine_used_ is False
-    assert model.numerical_guard_ is not None
+    model.mps_numerical_guard_every_n_steps = 2
+    model.train(max_epochs=5, enable_progress_bar=False, enable_model_summary=False)
+    assert model.flat_engine_used_ is True
+    summary = model.numerical_guard_.summary()
+    assert summary["checks"] >= 2
+    assert summary["diverged"] is False
+    assert np.isfinite(summary["max_relative_difference"])
 
 
 @pytest.mark.skipif(not mps_available, reason="flat engine is the Metal path")
