@@ -213,8 +213,12 @@ Because a miscompiled graph would produce plausible-looking but wrong losses, co
 Metal runs arm the numerical guard automatically: the model log-joint is cross-checked
 against the CPU during the run, and divergence is reported rather than published.
 Measured on an M2 Ultra at 5,000 × 10,000: ~114 ms/epoch compiled+fused against
-140 ms/epoch for the default eager+fused path, with the guard's worst relative
-difference at 2.3e-7. Compile without the fused kernel is *slower* than eager —
+140 ms/epoch for the eager+fused path, with the guard's worst relative
+difference at 2.3e-7. Both figures predate the flat engine and were taken with
+the harness before its timing was corrected, so they describe this pyro-based
+path against its own contemporaries, not against today's default — `train()`
+now runs the flat engine and the harness reports 32.2 ms/epoch at this shape.
+Compile without the fused kernel is *slower* than eager —
 inductor cannot fuse across Pyro's effect handlers, so the two optimisations are
 complements, not substitutes.
 
