@@ -4,9 +4,17 @@ Every guide parameter lives in two flat leaves -- unconstrained loc and
 softplus-unconstrained rho, matching AutoNormal's SoftplusPositive scale
 parameterization (verified per site at build time, not assumed). Each step draws
 one eps vector, reconstructs per-site tensors by slicing, and optimizes
-``-(flat_log_joint - flat_log_q)`` with Adam; gradients are clamped elementwise
-at +-10 to mirror the pyro path's ClippedAdam. The correctness chain to pyro is
-tests/test_flat_train.py -> test_flat_elbo.py -> test_flat_joint.py.
+``-(flat_log_joint - flat_log_q)`` with plain (unclipped) Adam -- deliberately.
+scvi's pyro path documents ClippedAdam but actually builds unclipped
+``pyro.optim.Adam``; an elementwise +-10 clamp we once added "for fidelity"
+caused late-horizon instability (loss bottoming at ~3600 epochs then spiking
+~1e6 nats with systematic ~2-posterior-sd abundance drift at 5000x10000 scale)
+because clamping the skewed, large-magnitude per-draw gradients of a summed
+log-likelihood biases their mean. Removing it restored parity: 100% of
+abundances within 1 posterior sd of the pyro path, r 0.992 (2026-08-11).
+Do not reintroduce clipping without a trajectory-validation artifact. The
+correctness chain to pyro is tests/test_flat_train.py -> test_flat_elbo.py ->
+test_flat_joint.py.
 
 Scope matches the flat log-joint: full batch, no dropout, no initial-value
 branches, single particle, unscaled ELBO. The caller falls back to the pyro
@@ -34,9 +42,6 @@ __all__ = ["FLAT_ENGINE_ENV_VAR", "FlatGuideState", "flat_training_loss", "flat_
 FLAT_ENGINE_ENV_VAR = "CELL2LOCATION_MPS_FLAT_ENGINE"
 
 _LOG_2PI = math.log(2.0 * math.pi)
-
-#: Elementwise gradient clamp, mirroring pyro ClippedAdam's default clip_norm.
-_GRAD_CLAMP = 10.0
 
 
 def _softplus_inv(x):
@@ -243,8 +248,6 @@ def run_flat_training(model, kwargs) -> bool:
             )
             return False
         loss.backward()
-        state.loc.grad.clamp_(-_GRAD_CLAMP, _GRAD_CLAMP)
-        state.rho.grad.clamp_(-_GRAD_CLAMP, _GRAD_CLAMP)
         optimizer.step()
         losses.append(loss_value)
 
