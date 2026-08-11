@@ -43,6 +43,7 @@ __all__ = [
     "flat_log_q_from_state",
     "pack_module",
     "run_flat_training",
+    "run_flat_minibatch_training",
 ]
 
 #: Set to 0 to disable the flat engine and train through the pyro path unchanged.
@@ -125,11 +126,20 @@ def flat_log_q_from_state(loc_flat, scale_flat, u_flat, state):
     return normal_lp - ladj
 
 
-def flat_training_loss(module, state, args, kwargs, eps):
-    """-(single-particle ELBO estimate) at u = loc + softplus(rho) * eps."""
+def flat_training_loss(module, state, args, kwargs, eps, log_joint_fn=None):
+    """-(single-particle ELBO estimate) at u = loc + softplus(rho) * eps.
+
+    ``log_joint_fn`` selects the model's transcription; it defaults to the spatial
+    one so existing callers and contracts are unchanged. The reference model
+    passes its own, and for a minibatch that transcription carries the plate's
+    n_obs/batch scale on the likelihood -- the guide term is unscaled either way,
+    because that model's latents are all global.
+    """
+    if log_joint_fn is None:
+        log_joint_fn = flat_log_joint
     scale_flat = torch.nn.functional.softplus(state.rho)
     u_flat = state.loc + scale_flat * eps
-    log_joint = flat_log_joint(module, args, kwargs, state.constrain(u_flat))
+    log_joint = log_joint_fn(module, args, kwargs, state.constrain(u_flat))
     return -(log_joint - flat_log_q_from_state(state.loc, scale_flat, u_flat, state))
 
 
@@ -147,6 +157,27 @@ _PACKED_MODEL_ATTRS = (
 )
 
 
+#: The reference model's small buffers. Its hyperparameters differ from the
+#: spatial model's and it has no ``cell_state``; ``n_obs`` rides along as a plain
+#: int because the plate scale needs it.
+_REFERENCE_PACKED_ATTRS = (
+    "detection_mean_hyp_prior_alpha", "detection_mean_hyp_prior_beta",
+    "gene_add_alpha_hyp_prior_alpha", "gene_add_alpha_hyp_prior_beta",
+    "gene_add_mean_hyp_prior_alpha", "gene_add_mean_hyp_prior_beta",
+    "alpha_g_phi_hyp_prior_alpha", "alpha_g_phi_hyp_prior_beta", "ones",
+)
+
+#: model class name -> (buffers to pack, attributes to carry through untouched).
+_PACK_SPEC = {
+    "LocationModelLinearDependentWMultiExperimentLocationBackgroundNormLevelGeneAlphaPyroModel": (
+        _PACKED_MODEL_ATTRS, ("cell_state", "n_batch"),
+    ),
+    "RegressionBackgroundDetectionTechPyroModel": (
+        _REFERENCE_PACKED_ATTRS, ("n_batch", "n_factors", "n_obs"),
+    ),
+}
+
+
 class _PackedModel:
     """The model's small hyperparameter buffers as lazy slices of ONE tensor.
 
@@ -158,19 +189,20 @@ class _PackedModel:
     """
 
     def __init__(self, pyro_model):
+        packed_attrs, passthrough = _PACK_SPEC[type(pyro_model).__name__]
         # One stray float64 buffer (detection_mean_hyp_prior_beta upstream) would
         # promote the whole pack via torch.cat; pin to the model's working dtype.
-        dtype = pyro_model.cell_state.dtype
+        dtype = getattr(pyro_model, "cell_state", pyro_model.ones).dtype
         chunks, layout, offset = [], {}, 0
-        for name in _PACKED_MODEL_ATTRS:
+        for name in packed_attrs:
             tensor = getattr(pyro_model, name).detach()
             layout[name] = (offset, offset + tensor.numel(), tuple(tensor.shape))
             chunks.append(tensor.reshape(-1).to(dtype))
             offset += tensor.numel()
         self._packed = torch.cat(chunks)
         self._layout = layout
-        self.cell_state = pyro_model.cell_state
-        self.n_batch = pyro_model.n_batch
+        for name in passthrough:
+            setattr(self, name, getattr(pyro_model, name))
 
     def __getattr__(self, name):
         layout = object.__getattribute__(self, "_layout")
@@ -186,16 +218,18 @@ def pack_module(module):
     return SimpleNamespace(model=_PackedModel(getattr(mod, "_orig_mod", mod)))
 
 
-def _flat_guard_check(guard, module, state, args, kwargs, epoch):
+def _flat_guard_check(guard, module, state, args, kwargs, epoch, log_joint_fn=None):
     """One guard comparison: flat_log_joint at the same fresh draw on the training
     device and on CPU. Identical latents make it deterministic -- any disagreement
     is device arithmetic, and it is exactly the arithmetic the flat engine trains
     on (the pyro-path guard compares the replayed model log-joint instead)."""
+    if log_joint_fn is None:
+        log_joint_fn = flat_log_joint
     with torch.no_grad():
         u_flat = state.loc + torch.nn.functional.softplus(state.rho) * torch.randn_like(state.loc)
         latents = state.constrain(u_flat)
         try:
-            device_loss = float(flat_log_joint(module, args, kwargs, latents))
+            device_loss = float(log_joint_fn(module, args, kwargs, latents))
         except Exception as exc:  # noqa: BLE001 - a failed check must not kill training
             logger.debug("Flat guard: device evaluation failed (%s).", exc)
             return None
@@ -205,7 +239,7 @@ def _flat_guard_check(guard, module, state, args, kwargs, epoch):
             cpu_args = tuple(a.cpu() if torch.is_tensor(a) else a for a in args)
             module.to("cpu")
             try:
-                reference_loss = float(flat_log_joint(module, cpu_args, kwargs, cpu_latents))
+                reference_loss = float(log_joint_fn(module, cpu_args, kwargs, cpu_latents))
             finally:
                 module.to(original_device)
         except Exception as exc:  # noqa: BLE001
@@ -242,6 +276,122 @@ def _full_batch_args(model, device):
     return args, kwargs
 
 
+def _minibatch_loader(model, batch_size):
+    """scvi's own loader, so batching and the registry match the pyro path exactly."""
+    from scvi.dataloaders import AnnDataLoader
+
+    return AnnDataLoader(model.adata_manager, shuffle=True, batch_size=batch_size)
+
+
+def _to_device(args, device):
+    return tuple(a.to(device) if torch.is_tensor(a) else a for a in args)
+
+
+def run_flat_minibatch_training(model, kwargs, log_joint_fn) -> bool:
+    """Minibatch flat training for models whose latents are all global.
+
+    The reference model's ``list_obs_plate_vars()["sites"]`` is empty, so a
+    minibatch step subsamples data only: the guide is global and unscaled, and
+    ``log_joint_fn`` carries the observation plate's n_obs/batch scale. Each
+    step's loss therefore estimates the FULL-data negative ELBO, which is what
+    scvi's ``elbo_train`` records (it is the epoch mean of per-step losses), so
+    the histories are directly comparable.
+
+    Batches come from scvi's AnnDataLoader rather than a device-resident copy of
+    the whole matrix: a caller who passed ``batch_size`` may have done so because
+    the data does not fit, and silently materialising all of it would defeat the
+    reason they asked.
+
+    Returns False (guide untouched) if the engine diverges.
+    """
+    module = model.module
+    device = torch.device("mps")
+    module.to(device)
+
+    loader = _minibatch_loader(model, kwargs["batch_size"])
+    probe_args, batch_kwargs = module._get_fn_args_from_batch(next(iter(loader)))
+    probe_args = _to_device(probe_args, device)
+
+    guide = module.guide
+    if getattr(guide, "prototype_trace", None) is None:
+        with torch.no_grad():
+            guide(*probe_args, **batch_kwargs)
+
+    state = FlatGuideState.from_guide(guide)
+    packed = pack_module(module)
+    lr = kwargs.get("lr", 0.002)
+    optimizer = _make_optimizer(state, lr)
+    max_epochs = kwargs.get("max_epochs", 30000)
+    logger.info(
+        "Flat engine (minibatch): training %s up to %d epochs (%d parameters, "
+        "batch_size=%d, lr=%g).",
+        type(getattr(module, "model", module)).__name__, max_epochs,
+        state.loc.numel(), kwargs["batch_size"], lr,
+    )
+
+    guard = None
+    if any(type(cb).__name__ == "_NumericalGuardCallback" for cb in kwargs.get("callbacks") or []):
+        guard = getattr(model, "numerical_guard_", None)
+
+    stopper = None
+    stop_cfg = getattr(model, "mps_early_stopping", None)
+    env_off = os.environ.get(EARLY_STOP_ENV_VAR, "1").lower() in ("0", "false", "no")
+    if stop_cfg and not env_off:
+        stopper = RelativeEarlyStopping(**stop_cfg)
+        model.early_stopping_ = stopper
+
+    losses = []
+    step = 0
+    for epoch in range(max_epochs):
+        epoch_losses = []
+        for batch in loader:
+            args, batch_kwargs = module._get_fn_args_from_batch(batch)
+            args = _to_device(args, device)
+
+            optimizer.zero_grad(set_to_none=True)
+            eps = torch.randn_like(state.loc)
+            loss = flat_training_loss(packed, state, args, batch_kwargs, eps, log_joint_fn)
+            loss_value = float(loss)
+            if not math.isfinite(loss_value):
+                logger.warning(
+                    "Flat engine diverged at epoch %d (loss=%r); guide left untouched, "
+                    "falling back to the pyro path.", epoch, loss_value,
+                )
+                return False
+            loss.backward()
+            optimizer.step()
+            epoch_losses.append(loss_value)
+
+            if guard is not None and guard.every_n_steps and step % guard.every_n_steps == 0:
+                _flat_guard_check(guard, module, state, args, batch_kwargs, step, log_joint_fn)
+            step += 1
+
+        # scvi logs elbo_train as the epoch MEAN of per-step losses; match it so
+        # history_ and the early-stopping signal mean the same thing on both paths.
+        epoch_loss = sum(epoch_losses) / len(epoch_losses)
+        losses.append(epoch_loss)
+
+        if stopper is not None:
+            shim = SimpleNamespace(
+                callback_metrics={stopper.monitor: epoch_loss}, current_epoch=epoch, should_stop=False
+            )
+            stopper.on_train_epoch_end(shim, None)
+            if shim.should_stop:
+                break
+
+    state.write_back(guide)
+    module.eval()
+    logger.info("Flat engine: finished after %d epochs (final loss %.6g).", len(losses), losses[-1])
+
+    import pandas as pd
+
+    history = pd.DataFrame({"elbo_train": losses})
+    history.index.name = "epoch"
+    model.history_ = {"elbo_train": history}
+    model.is_trained_ = True
+    return True
+
+
 def _make_optimizer(state, lr):
     try:
         return torch.optim.Adam([state.loc, state.rho], lr=lr, fused=True)
@@ -249,9 +399,10 @@ def _make_optimizer(state, lr):
         return torch.optim.Adam([state.loc, state.rho], lr=lr)
 
 
-def run_flat_training(model, kwargs) -> bool:
-    """Train the model's guide with the flat engine. Returns False (guide untouched)
-    if the engine diverges; raises NotVectorizable if the guide is out of scope."""
+def run_flat_training(model, kwargs, log_joint_fn=None) -> bool:
+    """Train the model's guide with the flat engine, full batch. Returns False
+    (guide untouched) if the engine diverges; raises NotVectorizable if the guide
+    is out of scope. ``log_joint_fn`` defaults to the spatial transcription."""
     module = model.module
     device = torch.device("mps")
     module.to(device)
@@ -294,13 +445,13 @@ def run_flat_training(model, kwargs) -> bool:
         optimizer.zero_grad(set_to_none=True)
         eps = torch.randn_like(state.loc)
         try:
-            loss = loss_fn(packed, state, args, batch_kwargs, eps)
+            loss = loss_fn(packed, state, args, batch_kwargs, eps, log_joint_fn)
         except Exception as exc:  # noqa: BLE001 - a compiled step may fail at runtime
             if loss_fn is flat_training_loss:
                 raise
             logger.warning("Compiled flat step failed (%s); retrying eager.", exc)
             loss_fn = flat_training_loss
-            loss = loss_fn(packed, state, args, batch_kwargs, eps)
+            loss = loss_fn(packed, state, args, batch_kwargs, eps, log_joint_fn)
         loss_value = float(loss)
         if not math.isfinite(loss_value):
             logger.warning(
@@ -313,7 +464,7 @@ def run_flat_training(model, kwargs) -> bool:
         losses.append(loss_value)
 
         if guard is not None and guard.every_n_steps and epoch % guard.every_n_steps == 0:
-            _flat_guard_check(guard, module, state, args, batch_kwargs, epoch)
+            _flat_guard_check(guard, module, state, args, batch_kwargs, epoch, log_joint_fn)
 
         if stopper is not None:
             shim = SimpleNamespace(

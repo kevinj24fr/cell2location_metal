@@ -241,8 +241,8 @@ def test_divergence_restores_params_and_falls_back(monkeypatch):
 
     real_loss = flat_train.flat_training_loss
 
-    def poisoned(module, state, args, kwargs, eps):
-        loss = real_loss(module, state, args, kwargs, eps)
+    def poisoned(module, state, args, kwargs, eps, log_joint_fn=None):
+        loss = real_loss(module, state, args, kwargs, eps, log_joint_fn)
         return loss * torch.nan
 
     monkeypatch.setattr(flat_train, "flat_training_loss", poisoned)

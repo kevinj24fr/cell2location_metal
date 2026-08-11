@@ -123,6 +123,47 @@ def flat_elbo(module, args, kwargs, unconstrained):
     return flat_log_joint(module, args, kwargs, latents) - flat_log_q(module, unconstrained)
 
 
+def log_joint_for(module):
+    """The flat transcription matching this module, or None if there isn't one.
+
+    Resolution is by pyro model type, deliberately. ``_flat_train_if_applicable``
+    lives on ``AppleSiliconTrainMixin``, which BOTH ``Cell2location`` and
+    ``RegressionModel`` inherit, so an engine that assumed one model would train
+    the other against the wrong density -- silently, since the shapes broadcast.
+    An unknown module resolves to None and the caller falls back to pyro.
+    """
+    from ._flat_reference import reference_log_joint, supports as _reference_supports
+
+    mod = getattr(module, "model", None)
+    if mod is None:
+        return None
+    mod = getattr(mod, "_orig_mod", mod)  # unwrap torch.compile
+    name = type(mod).__name__
+    if name == _SPATIAL_MODEL:
+        return flat_log_joint if _spatial_supports(mod) else None
+    if _reference_supports(mod):
+        return reference_log_joint
+    return None
+
+
+def _spatial_supports(mod) -> bool:
+    """Scope of the spatial transcription below.
+
+    Excludes models carrying initial values: the spatial ``forward`` emits extra
+    ``*_initial`` Gamma terms built from its ``init_val_*`` buffers, which this
+    transcription does not carry. (The reference model registers the same buffers
+    but never reads them in ``forward`` -- there they only initialize the guide --
+    so that model is not excluded on these grounds.)
+    """
+    return getattr(mod, "np_init_vals", None) is None
+
+
+#: The pyro model ``flat_log_joint`` below transcribes, by class name.
+_SPATIAL_MODEL = (
+    "LocationModelLinearDependentWMultiExperimentLocationBackgroundNormLevelGeneAlphaPyroModel"
+)
+
+
 def flat_log_joint(module, args, kwargs, latents):
     """log p(latents, data) for the spatial model, matching pyro replay exactly."""
     del kwargs
