@@ -37,24 +37,32 @@ _FLAT_EQUIVALENT_CALLBACKS = frozenset(
 )
 
 
-def _warm_up_guide(model, kwargs) -> None:
+def _warm_up_guide(model, kwargs, device) -> None:
     """Run the guide once so AutoNormal materializes its parameters.
 
-    Their shapes are what decides whether local sites can be row-indexed, and
-    AutoNormal builds them lazily on first call. A failure here is not fatal --
-    the caller's shape check simply finds nothing and routes to pyro.
+    Their shapes decide whether local sites can be row-indexed, and AutoNormal
+    builds them lazily on first call.
+
+    Deliberately warms up on ONE MINIBATCH, not the full dataset. A caller who
+    passed ``batch_size`` may have done so because the full matrix does not fit,
+    and materialising it here -- before the engine's own memory check has had a
+    chance to decline device residency -- would defeat that check for exactly
+    the caller it protects. Guide parameters are full size either way; only the
+    data passed through the guide differs.
+
+    A failure here is not fatal: the caller's shape check then finds nothing and
+    routes to pyro.
     """
     import torch
 
-    from ._device import resolve_accelerator
-    from ._flat_train import _full_batch_args
+    from ._flat_train import _minibatch_loader, _to_device
 
     try:
-        _, device = resolve_accelerator(kwargs.get("accelerator", "auto"), kwargs.get("device", "auto"))
         model.module.to(device)
-        args, batch_kwargs = _full_batch_args(model, device)
+        loader = _minibatch_loader(model, kwargs["batch_size"])
+        args, batch_kwargs = model.module._get_fn_args_from_batch(next(iter(loader)))
         with torch.no_grad():
-            model.module.guide(*args, **batch_kwargs)
+            model.module.guide(*_to_device(args, device), **batch_kwargs)
     except Exception as exc:  # noqa: BLE001
         logger.debug("Flat engine: guide warm-up failed (%s).", exc)
 
@@ -62,29 +70,24 @@ def _warm_up_guide(model, kwargs) -> None:
 def _supports_minibatch(module, n_obs=None) -> bool:
     """True when the engine can subsample this model's observation plate.
 
-    Two cases, both driven by the model's own ``list_obs_plate_vars`` rather
-    than a class list. With no per-observation latent sites the guide is global
-    and only the data subsamples. With local sites, they are subsampled with the
-    data -- which requires each one's guide parameter to be indexed by
-    observation, i.e. to have n_obs as its leading dimension. That is checked
-    against the guide rather than assumed, because a site whose leading axis
-    means something else would be silently mis-indexed.
+    Two cases, both driven by the model's own declaration (read once, in
+    ``_flat_train.local_plate_sites``). With no per-observation latent sites the
+    guide is global and only the data subsamples. With local sites, they are
+    subsampled with the data -- which requires each one's guide parameter to be
+    indexed by observation, i.e. to have n_obs as its leading dimension. That is
+    checked against the guide rather than assumed, because a site whose leading
+    axis means something else would be silently mis-indexed.
     """
-    mod = getattr(module, "model", None)
-    mod = getattr(mod, "_orig_mod", mod)
-    lister = getattr(mod, "list_obs_plate_vars", None)
-    if lister is None:
-        return False
-    try:
-        sites = lister()["sites"]
-    except Exception:  # noqa: BLE001 - an unreadable declaration is not a green light
+    from ._flat_train import local_plate_sites
+    from ._sampling import _autonormal_site_params
+
+    sites = local_plate_sites(module)
+    if sites is None:  # declaration unreadable; not a licence to subsample
         return False
     if not sites:
         return True
     if n_obs is None:
         return False
-
-    from ._sampling import _autonormal_site_params
 
     guide = getattr(module, "guide", None)
     if guide is None:
@@ -203,9 +206,13 @@ class AppleSiliconTrainMixin:
     def _flat_train_if_applicable(self, kwargs: dict) -> bool:
         """Train with the flat engine when its verified scope holds; False otherwise.
 
-        Scope: MPS device, full batch, single-particle unscaled Trace_ELBO, default
-        optimizer, an AutoNormal guide, no dropout, no initial-value branches. Any
-        miss -- including a divergence mid-run -- leaves training to the pyro path.
+        Scope: MPS device, single-particle unscaled Trace_ELBO, default optimizer,
+        an AutoNormal guide, no dropout, and a model with a flat transcription
+        whose own scope holds (``log_joint_for`` decides that, including the
+        initial-value branches the spatial transcription does not carry).
+        Minibatch is supported where the observation plate can be subsampled.
+        Any miss -- including a divergence mid-run -- leaves training to the pyro
+        path.
         """
         from ._flat_joint import log_joint_for
         from ._flat_train import FLAT_ENGINE_ENV_VAR, run_flat_minibatch_training, run_flat_training
@@ -237,7 +244,7 @@ class AppleSiliconTrainMixin:
             n_obs = getattr(getattr(self, "adata", None), "n_obs", None)
             # The guide must exist before its local sites can be shape-checked.
             if getattr(self.module.guide, "prototype_trace", None) is None:
-                _warm_up_guide(self, kwargs)
+                _warm_up_guide(self, kwargs, device)
             if not _supports_minibatch(self.module, n_obs):
                 return False
         callbacks = kwargs.get("callbacks") or []

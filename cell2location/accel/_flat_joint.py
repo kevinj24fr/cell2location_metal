@@ -123,6 +123,12 @@ def flat_elbo(module, args, kwargs, unconstrained):
     return flat_log_joint(module, args, kwargs, latents) - flat_log_q(module, unconstrained)
 
 
+#: The pyro model ``flat_log_joint`` below transcribes, by class name.
+_SPATIAL_MODEL = (
+    "LocationModelLinearDependentWMultiExperimentLocationBackgroundNormLevelGeneAlphaPyroModel"
+)
+
+
 def log_joint_for(module):
     """The flat transcription matching this module, or None if there isn't one.
 
@@ -156,12 +162,6 @@ def _spatial_supports(mod) -> bool:
     so that model is not excluded on these grounds.)
     """
     return getattr(mod, "np_init_vals", None) is None
-
-
-#: The pyro model ``flat_log_joint`` below transcribes, by class name.
-_SPATIAL_MODEL = (
-    "LocationModelLinearDependentWMultiExperimentLocationBackgroundNormLevelGeneAlphaPyroModel"
-)
 
 
 def flat_log_joint(module, args, kwargs, latents, plate_scale=1.0):
