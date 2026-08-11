@@ -42,6 +42,17 @@ numerical guard clean, and posterior summaries matching the replaced path within
 Monte-Carlo error. Changes that do not clear the gate do not merge, and are not
 listed.
 
+- **Flat likelihood through the fused NB kernel.** The flat engine's data
+  likelihood — its single biggest term — now routes through the same
+  self-verifying Metal kernel the pyro path uses (GammaPoisson(α, α/μ) ≡
+  NB(μ, θ=α), so the kernel receives μ directly and the eager expression's
+  ~dozen full-size intermediates disappear). Eager fallback is byte-identical
+  to the contract-pinned expression; the runtime guard now cross-checks the
+  kernel against eager CPU every guarded run (worst difference 2.3e-7).
+  Measured at 5,000×10,000 (M2 Ultra): flat step 54.4 → 24.1 ms (**2.26x**),
+  inside the workload's estimated bandwidth floor (~20–30 ms); harness
+  protocol 117.9 → 100.1 ms/epoch, ALL GATES PASS.
+
 - **Flat training engine.** Training no longer runs through pyro's effect
   handlers: all 17 sites' log-densities and the GammaPoisson likelihood are
   hand-transcribed tensor code, the mean-field guide lives in two flat tensors

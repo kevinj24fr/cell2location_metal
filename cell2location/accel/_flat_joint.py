@@ -49,6 +49,21 @@ def _gamma_poisson_lp(x, concentration, rate):
     ).sum()
 
 
+def _nb_lp(x, mu, alpha):
+    """Data likelihood: GammaPoisson(alpha, alpha/mu) == NB(mu, theta=alpha).
+
+    Routes through the self-verifying fused Metal kernel when available (the
+    eager expression materialises ~a dozen full-size intermediates; the kernel
+    reads each operand once). The eager fallback is byte-for-byte the expression
+    the CPU contract pins against pyro replay."""
+    from ._fused_nb import fused_log_nb_positive
+
+    fused = fused_log_nb_positive(x, mu, alpha)
+    if fused is not None:
+        return fused.sum()
+    return _gamma_poisson_lp(x, alpha, alpha / mu)
+
+
 def sample_latents_from_guide(module, args, kwargs, requires_grad: bool = False):
     """One draw of every latent from the mean-field guide, as leaf tensors."""
     from ._sampling import _autonormal_site_params
@@ -195,6 +210,6 @@ def flat_log_joint(module, args, kwargs, latents):
         "detection_y_s"
     ]
     alpha = obs2sample @ (ones / L["alpha_g_inverse"].pow(2))
-    lp = lp + _gamma_poisson_lp(x_data, alpha, alpha / mu)
+    lp = lp + _nb_lp(x_data, mu, alpha)
 
     return lp
