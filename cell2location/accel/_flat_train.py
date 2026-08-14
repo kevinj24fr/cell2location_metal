@@ -558,6 +558,7 @@ def run_flat_minibatch_training(model, kwargs, log_joint_fn) -> bool:
 
     losses = []
     step = 0
+    masked_grads = 0
     for epoch in range(max_epochs):
         epoch_losses = []
         for args, batch_kwargs in epoch_batches():
@@ -578,6 +579,8 @@ def run_flat_minibatch_training(model, kwargs, log_joint_fn) -> bool:
                 )
                 return False
             loss.backward()
+            masked_grads = _mask_nonfinite_grads(state, epoch, masked_grads,
+                                                 check=step % 200 == 0)
             optimizer.step()
             epoch_losses.append(loss_value)
 
@@ -617,6 +620,42 @@ def _make_optimizer(state, lr):
         return torch.optim.Adam([state.loc, state.rho], lr=lr, fused=True)
     except (RuntimeError, TypeError, ValueError):
         return torch.optim.Adam([state.loc, state.rho], lr=lr)
+
+
+def _mask_nonfinite_grads(state, epoch: int, masked_total: int, check: bool = False) -> int:
+    """Zero gradient elements fp32 cannot represent, so one gene cannot kill a run.
+
+    Observed on the b02 GBM reference (675k cells): a single gene's
+    ``alpha_g_inverse`` drifts small enough that the exact gradient through
+    ``alpha = x**-2`` exceeds float32 range. The LOSS at that step is finite
+    (5.035e9); the gradient is inf in exactly one of 2.47M elements; Adam turns
+    inf into NaN parameters and every later loss is NaN. This is NOT the
+    elementwise +-10 clamp that was measured to bias converged abundances and
+    removed -- that clipped every element of every step. Masking engages only
+    on non-finite elements, which occur precisely when the alternative is a
+    dead run: the poisoned element skips one update, everything else steps
+    normally, and finite-gradient training is bit-identical.
+
+    The zeroing (``nan_to_num_``) runs every step, on-device, async. COUNTING
+    what was zeroed forces a device sync, and a per-step sync measured 1.246x
+    on the minibatched reference arm (gate FAIL) -- so the counted, logged
+    check runs only on ``check`` steps. Protection is unconditional; the
+    warning is sampled.
+    """
+    counted = 0
+    for p in (state.loc, state.rho):
+        if p.grad is None:
+            continue
+        if check:
+            counted += int((~torch.isfinite(p.grad)).sum())
+        torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
+    if counted and masked_total < 50:
+        logger.warning(
+            "Flat engine: masked %d non-finite gradient element(s) at epoch %d "
+            "(fp32 overflow; the affected parameters skip this update).",
+            counted, epoch,
+        )
+    return masked_total + counted
 
 
 def run_flat_training(model, kwargs, log_joint_fn=None) -> bool:
@@ -661,6 +700,7 @@ def run_flat_training(model, kwargs, log_joint_fn=None) -> bool:
             logger.info("torch.compile unavailable for the flat step (%s); running eager.", exc)
 
     losses = []
+    masked_grads = 0
     for epoch in range(max_epochs):
         optimizer.zero_grad(set_to_none=True)
         eps = torch.randn_like(state.loc)
@@ -680,6 +720,8 @@ def run_flat_training(model, kwargs, log_joint_fn=None) -> bool:
             )
             return False
         loss.backward()
+        masked_grads = _mask_nonfinite_grads(state, epoch, masked_grads,
+                                             check=epoch % 200 == 0)
         optimizer.step()
         losses.append(loss_value)
 

@@ -275,3 +275,59 @@ def test_divergence_restores_params_and_falls_back(monkeypatch):
     # non-finite loss => flat engine aborts, pyro path completes the run
     assert model.flat_engine_used_ is False
     assert model.is_trained_ is True
+
+
+@pytest.fixture
+def propagating_c2l_logs():
+    """Same shape as test_guard_and_planner's fixture: the package logger sets
+    propagate=False, which hides its records from caplog."""
+    import logging
+
+    logger = logging.getLogger("cell2location")
+    original = logger.propagate
+    logger.propagate = True
+    try:
+        yield
+    finally:
+        logger.propagate = original
+
+
+def test_nonfinite_gradient_elements_are_masked_not_fatal(propagating_c2l_logs, caplog):
+    """One gene's fp32-overflowing gradient must not kill the run.
+
+    Pinned against the b02 GBM reference failure: alpha_g_inverse for a single
+    gene drifts small, the exact gradient through alpha = x**-2 exceeds float32
+    range while the LOSS is still finite, and un-masked Adam turns the inf into
+    NaN parameters -- after which every loss is NaN and the engine falls back to
+    pyro. Masking zeroes exactly the non-finite elements, warns, and leaves
+    every finite element's gradient untouched.
+    """
+    import logging
+    from types import SimpleNamespace
+
+    from cell2location.accel._flat_train import _mask_nonfinite_grads
+
+    loc = torch.zeros(5, requires_grad=True)
+    rho = torch.zeros(3, requires_grad=True)
+    loc.grad = torch.tensor([1.0, float("inf"), 2.0, float("nan"), 3.0])
+    rho.grad = torch.tensor([4.0, 5.0, 6.0])
+    state = SimpleNamespace(loc=loc, rho=rho)
+
+    with caplog.at_level(logging.WARNING):
+        total = _mask_nonfinite_grads(state, epoch=7, masked_total=0, check=True)
+
+    assert total == 2
+    assert loc.grad.tolist() == [1.0, 0.0, 2.0, 0.0, 3.0]
+    assert rho.grad.tolist() == [4.0, 5.0, 6.0], "finite gradients must be untouched"
+    assert any("non-finite gradient" in r.message for r in caplog.records)
+
+    # zeroing runs even on uncounted steps -- counting is sampled (a per-step
+    # count forces a device sync, measured 1.246x on the reference gate),
+    # protection is not
+    loc.grad = torch.tensor([1.0, float("inf"), 2.0, float("nan"), 3.0])
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        total = _mask_nonfinite_grads(state, epoch=8, masked_total=total, check=False)
+    assert total == 2, "uncounted steps do not add to the tally"
+    assert loc.grad.tolist() == [1.0, 0.0, 2.0, 0.0, 3.0], "but they still mask"
+    assert not caplog.records
