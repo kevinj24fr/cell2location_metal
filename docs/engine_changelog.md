@@ -24,6 +24,24 @@ median (contention only adds time). Each entry's *ratio* stands; its absolute
 ms/epoch is not comparable across entries, nor to what the harness prints
 today. The current baselines are in `benchmarks/*_baseline.json`.
 
+- **Non-finite gradient masking (correctness, not speed).** On a real 675k-cell
+  GBM reference, one gene's exact gradient through `alpha = alpha_g_inverse⁻²`
+  exceeded float32 range while the loss was still finite (5.035e9; inf in 1 of
+  2.47M gradient elements) — Adam turned the inf into NaN parameters, every
+  later loss was NaN, and the engine fell back to pyro at 8x the cost. Both
+  flat loops now zero exactly the non-finite gradient elements each step
+  (`nan_to_num_`, on-device, async — a counted per-step check costs a device
+  sync and measured 1.246x on the minibatched reference arm, so the logged
+  count runs on the guard cadence instead; protection is unconditional, the
+  warning is sampled). Finite-gradient training is bit-identical; this is not
+  the elementwise ±10 clamp that biased converged abundances and was removed —
+  that engaged on every element of every step, this engages only where the
+  alternative is a dead run. Survival-verified on the failing reference fit
+  (masked 2 elements at the fatal epoch, completed 30/30 finite, final loss
+  parity with the pyro path). Gates: spatial **1.011x** baseline (train),
+  export 0.965x; minibatch arm pass; reference **1.074x** — all inside the
+  no-regression tolerance, ALL GATES PASS on every arm.
+
 - **Minibatch training for the spatial model.** Passing `batch_size` used to
   drop the spatial model onto the pyro path, so the caller whose data does not
   fit in memory — the one who needs the help most — got none of this fork. The

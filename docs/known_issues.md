@@ -24,10 +24,13 @@ Practical guidance:
 - `CELL2LOCATION_MPS_FUSED_NB=0` disables the fused kernel; the eager path
   produced zero corrupted results across every soak test and is bitwise
   deterministic. Cost: roughly 2x on the spatial training epoch.
-- The eager flat-engine likelihood currently lacks the fused kernel's epsilon
-  floors and can NaN on some real reference datasets; when that happens the
-  engine falls back to the (slower, correct) pyro path automatically and says
-  so in the log.
+- (Resolved 2026-08-14.) The flat engine used to die on some real reference
+  datasets — one gene's exact gradient through `alpha = x⁻²` exceeds float32
+  range while the loss is still finite, and Adam turns the inf into NaN
+  parameters. The trainer now zeroes exactly the non-finite gradient elements
+  (warning logged); finite-gradient training is bit-identical. An earlier note
+  here attributed the NaN to missing epsilon floors in the eager likelihood —
+  that was wrong; the value was finite, the gradient was not.
 
 This section will be updated when the defect is fixed upstream or worked
 around; the investigation's reproduction scripts live outside the package.
