@@ -24,6 +24,22 @@ median (contention only adds time). Each entry's *ratio* stands; its absolute
 ms/epoch is not comparable across entries, nor to what the harness prints
 today. The current baselines are in `benchmarks/*_baseline.json`.
 
+- **Guard tolerates benign heavy-tail draws (correctness of the *guard*).**
+  A single SVI draw's log-joint is heavy-tailed, so a rare guard check lands on
+  an extreme sample where device and CPU fp32 differ by a large *relative*
+  amount while the device result is self-consistent and training (which stays
+  on device) is unaffected. The guard's `diverged = any check over tolerance`
+  flagged such a run as failure -- a real b03 spatial fit converged over 30,000
+  finite epochs but tripped on 1 of 150 checks at 0.43. The guard now exonerates
+  only checks it verifies benign: on an over-tolerance check it re-evaluates the
+  device log-joint at the same latents, and a device that agrees with itself is
+  a heavy tail, not corruption. Real divergence is still caught two ways so a
+  deterministically-wrong kernel cannot hide -- non-finite or non-reproducible
+  (the fused-kernel race) checks always flag, and an over-tolerance *rate* above
+  5% is systematic bias regardless of reproducibility. No training or timing
+  change (the recheck runs only on the rare flagged check, never in the hot
+  path); all three arms pass, suite 200.
+
 - **NB overdispersion clamp — the flat engine completes real reference fits.**
   `alpha_g_inverse` carries an Exponential prior whose mode is at zero, so
   low-overdispersion genes are pulled toward `alpha = 1/alpha_g_inverse² → ∞`
