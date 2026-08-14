@@ -114,3 +114,23 @@ def test_flat_log_joint_gradients_match_pyro(spatial_model, seed):
         assert (fg - pg).abs().max() <= 1e-4 * scale, (
             f"{name}: max grad diff {(fg - pg).abs().max():.3e} vs scale {scale:.3e}"
         )
+
+
+def test_stable_alpha_caps_the_poisson_limit_but_is_a_noop_in_range():
+    """alpha = 1/alpha_g_inverse**2 overflows fp32 as the parameter underflows to
+    zero (the model's Exponential prior drives low-overdispersion genes there),
+    NaN-ing the log-joint. _stable_alpha caps alpha at the representable Poisson
+    limit while leaving every in-range value untouched, so the pyro-replay pins
+    above are unaffected (they operate far below the cap).
+    """
+    from cell2location.accel._flat_joint import _ALPHA_MAX, _stable_alpha
+
+    ones = torch.ones(4)
+    # underflowed parameter -> would be inf; capped instead
+    agi = torch.tensor([1.0, 0.1, 1e-30, 0.0])
+    alpha = _stable_alpha(agi, ones)
+    assert torch.isfinite(alpha).all(), "alpha must be finite even at parameter 0"
+    assert alpha[0] == 1.0 and abs(alpha[1] - 100.0) < 1e-3, "in-range values untouched"
+    assert alpha[2] == _ALPHA_MAX and alpha[3] == _ALPHA_MAX, "extreme values capped"
+    # the cap is orders of magnitude above any harness/contract alpha
+    assert _ALPHA_MAX >= 1e5

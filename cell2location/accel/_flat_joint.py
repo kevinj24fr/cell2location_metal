@@ -39,6 +39,25 @@ def _exponential_lp(x, rate):
     return (torch.log(rate) - rate * x).sum()
 
 
+#: NB overdispersion ceiling. ``alpha_g_inverse`` has an Exponential prior whose
+#: mode is at zero, so low-overdispersion genes are pulled toward
+#: ``alpha = 1/alpha_g_inverse**2 -> inf`` (the Poisson limit). In fp32 that
+#: parameter eventually underflows to 0, ``1/0 = inf``, and ``inf - inf`` NaNs the
+#: log-joint -- which used to force the pyro fallback (epoch ~75 on the b02 GBM
+#: reference). At 1e6 the negative binomial is Poisson to < 1e-3 relative for the
+#: count range these models see (excess variance mu/alpha), so the ceiling is
+#: numerically invisible to converged signatures while keeping the limit
+#: representable. It is orders of magnitude above any alpha reached in the
+#: contract-test / harness regimes, so it is a no-op there and the pyro-replay
+#: pins are unaffected. Both transcriptions build alpha through this.
+_ALPHA_MAX = 1.0e6
+
+
+def _stable_alpha(alpha_g_inverse, ones):
+    """alpha = 1/alpha_g_inverse**2, clamped to the representable Poisson limit."""
+    return torch.clamp(ones / alpha_g_inverse.pow(2), max=_ALPHA_MAX)
+
+
 def _gamma_poisson_lp(x, concentration, rate):
     return (
         concentration * torch.log(rate)
@@ -259,7 +278,7 @@ def flat_log_joint(module, args, kwargs, latents, plate_scale=1.0):
     mu = ((L["w_sf"] @ mod.cell_state) * L["m_g"] + (obs2sample @ L["s_g_gene_add"])) * L[
         "detection_y_s"
     ]
-    alpha = obs2sample @ (ones / L["alpha_g_inverse"].pow(2))
+    alpha = obs2sample @ _stable_alpha(L["alpha_g_inverse"], ones)
     local = local + _nb_lp(x_data, mu, alpha)
 
     return lp + plate_scale * local
