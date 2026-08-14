@@ -24,6 +24,23 @@ median (contention only adds time). Each entry's *ratio* stands; its absolute
 ms/epoch is not comparable across entries, nor to what the harness prints
 today. The current baselines are in `benchmarks/*_baseline.json`.
 
+- **NB overdispersion clamp — the flat engine completes real reference fits.**
+  `alpha_g_inverse` carries an Exponential prior whose mode is at zero, so
+  low-overdispersion genes are pulled toward `alpha = 1/alpha_g_inverse² → ∞`
+  (the Poisson limit). In fp32 that parameter underflows to zero, `1/0 = inf`,
+  and `inf − inf` NaNs the forward log-joint — which on the 675k-cell GBM
+  reference happened at epoch ~75 and forced the whole fit onto the 8x-slower
+  pyro fallback (the gradient-masking fix above kept parameters finite but
+  could not stop the *value* overflow one level up). `_stable_alpha` caps
+  `alpha` at 1e6, beyond which the negative binomial is Poisson to <1e-3 for
+  these count ranges (excess variance μ/α) — numerically invisible to
+  converged signatures, orders of magnitude above any α in the contract-test
+  or harness regimes, so the pyro-replay pins are untouched. The b02 reference
+  now completes all 250 epochs on the flat engine, no fallback, final loss
+  marginally below the pyro-path fits (5.098e9 vs 5.106e9). Gates: spatial
+  0.977x, minibatch 1.008x, reference **0.911x** (faster — it stays on the
+  flat engine instead of falling back), suite 198, ALL GATES PASS every arm.
+
 - **Non-finite gradient masking (correctness, not speed).** On a real 675k-cell
   GBM reference, one gene's exact gradient through `alpha = alpha_g_inverse⁻²`
   exceeded float32 range while the loss was still finite (5.035e9; inf in 1 of
