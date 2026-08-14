@@ -1,7 +1,7 @@
 {
-  "train_ms_per_epoch": 31.06169999421885,
+  "train_ms_per_epoch": 31.45301529827217,
   "final_elbo": 210205952.0,
-  "export_seconds": 10.638091082917526,
+  "export_seconds": 10.213630124926567,
   "flat_engine_used": true,
   "export_parity_median_rel": {
     "accessibility": 0.0,
@@ -19,14 +19,14 @@
     "tolerance": 0.001
   },
   "train_ms_all_runs": [
-    31.2,
-    32.2,
-    31.1
+    31.8,
+    39.2,
+    31.5
   ],
   "export_seconds_all_runs": [
-    11.04,
-    10.71,
-    10.64
+    10.21,
+    10.34,
+    10.29
   ],
   "repeats": 3,
   "minibatch": null
