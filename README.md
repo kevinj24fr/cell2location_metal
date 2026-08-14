@@ -1,199 +1,104 @@
 # cell2location_metal
 
-**cell2location with first-class Apple silicon support.** A fork of
-[BayraktarLab/cell2location](https://github.com/BayraktarLab/cell2location) that makes
-the full workflow — reference signatures, spatial mapping, posterior export — run
-fast, correctly, and with zero configuration on the Metal (MPS) backend, while
-staying behaviourally identical to upstream on CPU and CUDA.
+**cell2location optimized for Apple silicon.** A fork of
+[BayraktarLab/cell2location](https://github.com/BayraktarLab/cell2location):
+28× CPU speedup on an M2 Ultra for the spatial model, with runtime CPU/MPS
+numerical verification and posterior parity against upstream. The statistical
+model is unchanged; CPU and CUDA retain upstream behaviour exactly.
 
-**What this fork adds:**
+## Current performance
 
-- **Zero-config Metal training.** `model.train()` picks the GPU, converts dtypes in
-  place, keeps the full batch device-resident, and routes the negative-binomial
-  likelihood through a fused Metal kernel that verifies itself against the eager
-  implementation (forward *and* gradients) before it is allowed to run.
-- **A numerical guard.** During training, the model log-joint is periodically
-  recomputed on the CPU under the same sampled latents and compared. Silent GPU
-  divergence — the failure mode that matters — is caught on your data, during your
-  run, not on synthetic shapes.
-- **`torch.compile` on Metal.** `train_compiled()` works (torch ≥ 2.12) and arms the
-  guard automatically.
-- **Measured on an M2 Ultra, 128 GB** (5,000 locations × 10,000 genes, full
-  batch, spatial model): CPU 897.5 ms/epoch → **Metal 32.2 ms/epoch (28x)**,
-  with guard-verified CPU/GPU agreement at 2×10⁻⁷ relative. Both figures come
-  from the same protocol in the same session — minimum of three runs after a
-  discarded warm-up, guard off (it cross-checks on the CPU, so timing it
-  measures the verifier) — because a ratio between two differently-measured
-  numbers means nothing. Reproduce with `benchmarks/engine_validation.py`.
-- **Every number here is from one machine.** An M2 Ultra with 128 GB. The Metal
-  path has not been measured on M1, M3 or M4, nor on a low-memory
-  configuration, and CI cannot exercise MPS. Correctness is defended by the
-  numerical guard and the test suite on whatever machine you run; the
-  *performance* figures are a single data point.
-- **Verified by 195 tests** — upstream's own test module plus the fork's
-  Metal-layer contracts, which pin the flat engine's log-joint, ELBO and
-  per-latent gradients against pyro replay — and a benchmark/parity harness
-  (`benchmarks/apple_silicon_check.py`) that produces a shareable HTML report.
+| Operation | Baseline | Metal | Speedup |
+|---|---|---|---|
+| Spatial training (5,000 × 10,000, full batch) | 897.5 ms/epoch (upstream, CPU) | 32.2 ms/epoch | **28×** |
+| Spatial training, minibatch (`batch_size=1250`) | 440.5 ms/epoch (pyro path, MPS) | 70.0 ms/epoch | **6.3×** |
+| Reference model (10,000 × 10,000, `batch_size=2500`) | 569.6 ms/epoch (pyro path, MPS) | 194.4 ms/epoch | **2.9×** |
+| Posterior export (1,000 samples) | 181.2 s (looped sampler) | 11.1 s | **16.3×** |
 
-**Install this fork:**
+One machine: **M2 Ultra, 128 GB**. Not measured on M1/M3/M4 or low-memory
+configurations, and CI cannot exercise MPS — treat the performance figures as a
+single data point. Baseline arm and protocol differ per row (stated in
+parentheses); measurement protocol and each change's gate numbers:
+[docs/engine_changelog.md](docs/engine_changelog.md). Reproduce with
+`benchmarks/engine_validation.py` and `benchmarks/reference_validation.py`.
+
+## Install
 
 ```bash
 pip install git+https://github.com/kevinj24fr/cell2location_metal.git
 ```
 
-Details, escape hatches, and known limits: [docs/apple_silicon.md](docs/apple_silicon.md).
-Everything below describes the cell2location method itself, unchanged from upstream.
+## What changed
 
-### What speed does not change
+cell2location's probabilistic model remains the reference implementation. On
+supported MPS configurations, training runs on a specialized tensor execution
+engine that reproduces the pyro computation without pyro's effect-handler
+overhead; the negative-binomial likelihood is executed by a fused Metal kernel.
+Unsupported configurations fall back to upstream execution automatically.
 
-This fork makes cell2location run faster on Apple silicon. It does not alter
-the model, and it does not make the model's output mean more than it did.
+```
+cell2location API ──> flat inference engine ──> fused Metal NB kernel
+                            │
+                            ▼
+                pyro model == parity / guard oracle
+```
 
-One limit is worth stating here rather than leaving for a reader to discover,
-because a fork advertising speed is someone's entry point to the method. In an
-in-house validation against paired Xenium ground truth (GBM, 55 µm and 25 µm
-bins), cell2location's **point estimates tracked truth well** (r 0.78–0.94 at
-55 µm, 0.86–0.96 at 25 µm) while **credible-interval coverage was
-approximately zero** — absolute density was underestimated roughly two-fold,
-with the panel/chemistry transfer absorbed into the detection prior and
-mean-field intervals far too narrow.
+- **Flat inference engine** — the model's log-joint, ELBO and mean-field guide
+  as plain tensor code, for both the spatial and reference models, minibatched
+  where the model allows it.
+- **Fused Metal NB kernel** — the likelihood's dozen full-size intermediates
+  collapsed into one bandwidth-bound pass, self-verified against the eager
+  implementation before it is allowed to run.
+- **Vectorized posterior export** — all draws as one batched transform per
+  site instead of a thousand sequential guide traces.
+- **Convergence-based early stopping** — training stops when the ELBO
+  plateaus instead of running upstream's fixed 30,000 epochs.
+- **Zero configuration** — `model.train()` picks the device, converts dtypes,
+  and stages data; every optimization has an escape hatch
+  (see [docs/apple_silicon.md](docs/apple_silicon.md)).
 
-So: relative abundance, rankings, spatial patterns and point-estimate
-co-occurrence are supported. **Absolute cell counts and credible intervals are
-not.** This is a property of the method's mean-field posterior, not something
-this fork introduces or could fix by running faster — it applies equally to
-upstream. Treat the intervals as a diagnostic, not as evidence.
+## How correctness is checked
 
-## Engine changelog (validated)
+The accelerated engine reproduces upstream's model log-joint and per-latent
+gradients against pyro replay (contract tests), and every engine change is
+gated on converged-ELBO parity and posterior-summary parity before it can
+merge. At runtime, a numerical guard periodically recomputes the training
+computation on the CPU under the same sampled latents and compares — silent
+GPU divergence is caught on your data, during your run, not on synthetic
+shapes.
 
-Every entry here cleared a push gate before merging: measurably faster than what
-it replaced, final-ELBO parity within 0.5%, numerical guard clean, and posterior
-summaries matching the replaced path within Monte-Carlo error. Changes that do
-not clear the gate do not merge, and are not listed. The gates are
-`benchmarks/engine_validation.py` (spatial model, `--minibatch` for its
-minibatch configuration) and `benchmarks/reference_validation.py` (reference
-signature model); a change touching shared code must pass every arm.
+## Scientific scope
 
-**On the numbers below.** Each entry records what that change measured against
-the baseline current *at the time*, with the harness as it existed then. The
-harness has since been corrected in ways that shift absolute figures without
-changing what any entry demonstrated: timing now excludes the numerical guard
-(which cross-checks on the CPU, so timing it measured the verifier rather than
-training), discards a warm-up run, frees each repeat's model (holding them made
-every later run slower), and reports the minimum of the repeats rather than the
-median (contention only adds time). Each entry's *ratio* stands; its absolute
-ms/epoch is not comparable across entries, nor to what the harness prints
-today. The current baselines are in `benchmarks/*_baseline.json`.
+Speed does not change what the output means. In an in-house benchmark against
+paired Xenium ground truth (GBM, 55 µm and 25 µm bins), cell2location's point
+estimates tracked truth well (r 0.78–0.94 at 55 µm, 0.86–0.96 at 25 µm) while
+credible-interval coverage was approximately zero and absolute density was
+underestimated roughly two-fold. In this benchmark, the nominal posterior
+intervals should therefore not be interpreted as calibrated uncertainty;
+whether that failure is primarily mean-field inference, cross-platform
+measurement differences, model specification, or their combination remains
+unresolved. For this benchmark: relative abundance, rankings and spatial
+patterns were robust; **absolute cell counts and credible intervals were
+not**. This applies equally to upstream — the fork changes execution speed,
+not the posterior's meaning.
 
-- **Minibatch training for the spatial model.** Passing `batch_size` used to
-  drop the spatial model onto the pyro path, so the caller whose data does not
-  fit in memory — the one who needs the help most — got none of this fork. The
-  flat engine now subsamples the observation plate, per-location latents
-  included: the five of them (`w_sf`, `detection_y_s`,
-  `n_s_cells_per_location`, `b_s_groups_per_location`, `z_sr_groups_factors`)
-  are indexed with the data, and their priors and their `log q` carry the
-  plate's `n_obs/batch` scale alongside the likelihood. Which sites those are is
-  read from the model's own `list_obs_plate_vars()`, and each one's guide
-  parameter is checked to actually be indexed by observation before the engine
-  will subsample it — a site shaped otherwise routes to pyro rather than being
-  silently mis-indexed. Measured at 5,000 × 10,000, `batch_size=1250`
-  (M2 Ultra): **440.5 → 70.0 ms/epoch (6.3x)**, ELBO parity, guard clean
-  (2.3e-7), export parity unchanged. The arithmetic is pinned against pyro
-  replay through a genuinely subsampled plate at three batch sizes.
+## Compatibility and fallbacks
 
-- **Device-resident minibatches.** Profiling the reference model's step showed
-  the arithmetic was not the cost: the flat step took 11.4 ms while scvi's
-  loader collation plus the host-to-device copy took 16.7 ms, so 59% of each
-  step went to moving data that never changes. When the training matrix fits on
-  the device with headroom it is now staged once and minibatches are gathered
-  there. Residency is a measured decision, not an assumption — a caller passing
-  `batch_size` may be doing it precisely because the data does not fit, so the
-  estimate is checked against the driver's recommended working set (and
-  declines when that is unavailable). Batch composition is unchanged: a fresh
-  permutation each epoch, trailing partial batch kept. Measured at 10,000 ×
-  10,000, `batch_size=2500` (M2 Ultra): **182.2 → 119.6 ms/epoch (1.52x)**,
-  median of three runs, ELBO parity, guard clean (1.6e-7). Both paths are
-  pinned to agree on where training lands, so residency stays a performance
-  choice rather than a numerical one.
+**What this fork does not do:**
 
-- **Flat engine for the reference signature model, with minibatches.** Every
-  number below this entry describes the spatial model. The reference model --
-  step 1 of every workflow, where per-cluster expression signatures are
-  estimated -- trained through pyro regardless, so half the pipeline saw none of
-  it. It now runs on the flat engine, and unlike the spatial engine it
-  minibatches, which it must: `RegressionModel` defaults to `batch_size=2500`
-  because real references are large. That is possible here because this model
-  declares no per-observation latent sites — all nine of its latents are
-  global — so a minibatch step subsamples the data and scales the likelihood by
-  `n_obs/batch`, rather than having to subsample the guide in lockstep (the
-  spatial model has five per-location latents and stays full-batch; a spatial
-  caller passing `batch_size` still routes to pyro). Batches come from scvi's
-  own loader rather than a device-resident copy of the matrix, since a caller
-  who asked for minibatching may have done so because the data does not fit.
-  Measured at 10,000 cells × 10,000 genes, `batch_size=2500` (M2 Ultra):
-  **569.6 → 194.4 ms/epoch (2.93x)**, final-ELBO parity within 0.15%, guard
-  clean (12 checks, worst GPU/CPU difference 2.4e-7). The spatial harness was
-  re-run unchanged on the same commit and still passes every gate. Contracts:
-  the transcription is pinned against pyro replay for value and per-latent
-  gradients at three batch sizes, so the plate scale cannot silently drift.
-  Kill switch `CELL2LOCATION_MPS_FLAT_ENGINE=0`, shared with the spatial engine.
+- Does not change the cell2location generative model.
+- Does not claim improved biological accuracy.
+- Does not require Apple silicon; CPU/CUDA retain upstream behaviour.
+- Does not claim performance generalization beyond the tested M2 Ultra.
+- Unsupported accelerated configurations fall back to the upstream pyro path
+  automatically.
 
-- **Flat likelihood through the fused NB kernel.** The flat engine's data
-  likelihood — its single biggest term — now routes through the same
-  self-verifying Metal kernel the pyro path uses (GammaPoisson(α, α/μ) ≡
-  NB(μ, θ=α), so the kernel receives μ directly and the eager expression's
-  ~dozen full-size intermediates disappear). Eager fallback is byte-identical
-  to the contract-pinned expression; the runtime guard now cross-checks the
-  kernel against eager CPU every guarded run (worst difference 2.3e-7).
-  Measured at 5,000×10,000 (M2 Ultra): flat step 54.4 → 24.1 ms (**2.26x**),
-  inside the workload's estimated bandwidth floor (~20–30 ms); harness
-  protocol 117.9 → 100.1 ms/epoch, ALL GATES PASS.
-
-- **Flat training engine.** Training no longer runs through pyro's effect
-  handlers: all 17 sites' log-densities and the GammaPoisson likelihood are
-  hand-transcribed tensor code, the mean-field guide lives in two flat tensors
-  (unconstrained loc, softplus-unconstrained scale), and each step draws one
-  reparameterized sample and optimizes −(log-joint − log q) with unclipped
-  Adam — matching what the pyro path actually uses (its ClippedAdam docstring
-  is stale; an elementwise clamp tried first destabilized long runs with a
-  measured ~2-posterior-sd abundance shift and was removed on that artifact).
-  Transcription, ELBO and per-draw gradients are contract-pinned against pyro
-  replay; the numerical guard runs natively (same-latents flat log-joint, MPS
-  vs CPU). Validation harness at 5,000×10,000 (M2 Ultra): training 274.9 →
-  117.9 ms/epoch (**2.33x**), final-ELBO parity, guard clean (worst CPU/GPU
-  difference 7.6e-8), export parity unchanged. Same-data trajectory comparison
-  against the pyro path at convergence, early stopping active: final-loss
-  parity 1.2e-6 by tail median (the tail mean is one heavy-tail single-draw
-  outlier — ~1 in 700 epochs, both engines' estimator family — away from
-  meaningless), abundance r 0.992 with **100% of values within 1 posterior
-  standard deviation** (median drift 0.08 sd), **2.3x wall-clock**. Scope:
-  full-batch MPS training with the default AutoNormal guide; minibatch, custom
-  optimizers/callbacks, loaded-model warmups and other unhandled arguments fall
-  back to the pyro path automatically. Kill switch
-  `CELL2LOCATION_MPS_FLAT_ENGINE=0`.
-
-- **Convergence-based early stopping (Metal runs).** Upstream trains a fixed
-  30,000 epochs with no stopping criterion; the ELBO plateaus long before that and
-  the remainder is a random walk on a flat objective. Training now stops when the
-  best ELBO has not improved by 1e-5 (relative) within 2,000 epochs. Validated by
-  a same-seed 30k-epoch reference comparison at 5,000×10,000 (M2 Ultra): **3.1x
-  wall-clock** (72.6 → 23.5 min), final-ELBO parity, abundance r = 0.990 with
-  every value within 1 posterior standard deviation of the full run (median drift
-  0.34 sd). A ~7x looser setting exists but drifts beyond the posterior's own
-  resolution and is deliberately not the default. Disable with
-  `model.mps_early_stopping = None` or `CELL2LOCATION_MPS_EARLY_STOP=0` to
-  reproduce upstream's fixed-epoch behaviour exactly.
-
-- **Vectorized posterior export.** The looped sampler ran one full guide trace per
-  posterior draw — a thousand sequential traces through pyro's effect handlers. For
-  the mean-field `AutoNormal` guides both models use by default, the joint
-  factorizes over sites, so all draws are one batched
-  `transform(loc + scale · eps)` per site: the same distribution, shaped as a
-  batch. Falls back to the loop for non-mean-field guides, minibatched export, or
-  observed-site sampling. Validation harness at 5,000 locations × 10,000 genes,
-  1,000 samples, M2 Ultra: export 181.2s → 11.1s (**16.3x**); summary parity vs
-  the loop within Monte-Carlo error (means 0.3%, quantiles 0.6% median relative);
-  final-ELBO parity and numerical guard clean (worst CPU/GPU difference 1.5e-7).
+Every optimization has a kill switch; the environment variables are documented
+in [docs/apple_silicon.md](docs/apple_silicon.md). Known open issues,
+including an intermittent torch 2.12.x custom-kernel dispatch defect that the
+runtime guard detects: [docs/known_issues.md](docs/known_issues.md). Full
+optimization history with per-change validation numbers:
+[docs/engine_changelog.md](docs/engine_changelog.md).
 
 ---
 
