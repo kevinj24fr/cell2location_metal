@@ -33,7 +33,7 @@ deliberately not transcribed here; ``log_joint_for`` resolves such a module to
 
 import torch
 
-from ._flat_joint import _exponential_lp, _gamma_lp, _nb_lp
+from ._flat_joint import _exponential_lp, _gamma_lp, _nb_lp, _stable_alpha
 
 
 def reference_log_joint(module, args, kwargs, latents, plate_scale=None):
@@ -95,7 +95,7 @@ def reference_log_joint(module, args, kwargs, latents, plate_scale=None):
     lp = lp + _exponential_lp(L["alpha_g_inverse"], L["alpha_g_phi_hyp"])
 
     # --- data likelihood, scaled by the observation plate ---
-    alpha = ones / L["alpha_g_inverse"].pow(2)
+    alpha = _stable_alpha(L["alpha_g_inverse"], ones)
     mu = (obs2label @ L["per_cluster_mu_fg"] + obs2sample @ L["s_g_gene_add"]) * detection_y_c
 
     if plate_scale is None:
