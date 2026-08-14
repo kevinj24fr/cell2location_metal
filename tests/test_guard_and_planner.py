@@ -61,51 +61,34 @@ def test_guard_flags_a_diverged_device():
     assert guard.summary()["max_relative_difference"] == pytest.approx(0.01)
 
 
-def test_guard_exonerates_a_reproducible_heavy_tail_draw():
-    """A single over-tolerance check that the flat guard verified as reproducible
-    (device self-consistent) is a benign heavy-tail draw, not divergence -- the
-    b03 spatial fit tripped exactly this (1 of 150 checks at 0.43, converged
-    finite). But an UNverified over-tolerance check still diverges (pyro path),
-    and a non-reproducible one always diverges (real corruption)."""
+def test_guard_tolerates_a_lone_heavy_tail_draw_but_flags_a_high_rate():
+    """A single SVI draw is heavy-tailed; one extreme check among many must not
+    fail an otherwise converged run (b03 spatial: 1 of 150 checks at 0.43 on a
+    fit that ran 30,000 finite epochs). A HIGH rate of over-tolerance checks is
+    real bias -- a wrong kernel misses on essentially every check -- and must
+    still flag. Judged by rate, not the single worst."""
     tol = 1e-3
-    benign = _record(9200, 1430.0, 1000.0)      # 0.43 rel, but device-reproducible
-    benign["reproducible_benign"] = True
-    real = _record(9200, 1430.0, 1000.0)        # same magnitude, NOT reproducible
-    real["reproducible_benign"] = False
-
-    g_benign = NumericalGuard(tolerance=tol)
-    g_benign.history = [_record(i, 1000.0, 1000.0) for i in range(149)] + [benign]
-    assert not g_benign.diverged, "one reproducible heavy-tail draw is not divergence"
-
-    g_real = NumericalGuard(tolerance=tol)
-    g_real.history = [_record(i, 1000.0, 1000.0) for i in range(149)] + [real]
-    assert g_real.diverged, "a non-reproducible divergence must still flag"
-
-    g_pyro = NumericalGuard(tolerance=tol)
-    g_pyro.history = [_record(1000, 1010.0, 1000.0)]  # no key => pyro path, unchanged
-    assert g_pyro.diverged, "pyro-path records (no benign key) behave as before"
-
-
-def test_guard_flags_a_reproducible_but_systematic_bias():
-    """The hole reproducibility alone would leave: a deterministically wrong
-    kernel is reproducible on EVERY check, so each check is individually marked
-    benign -- but a high RATE of over-tolerance checks is bias, not a heavy tail,
-    and must still flag. One benign outlier in 150 does not; 20 in 150 does."""
-    tol = 1e-3
-
-    def benign(step):
-        r = _record(step, 1005.0, 1000.0)  # 0.5% over tol, device-reproducible
-        r["reproducible_benign"] = True
-        return r
 
     g_one = NumericalGuard(tolerance=tol)
-    g_one.history = [_record(i, 1000.0, 1000.0) for i in range(149)] + [benign(9200)]
-    assert not g_one.diverged, "0.7% benign rate is a heavy tail"
+    g_one.history = [_record(i, 1000.0, 1000.0) for i in range(149)] + [_record(9200, 1430.0, 1000.0)]
+    assert not g_one.diverged, "0.7% over-tolerance is a heavy tail, not divergence"
 
     g_many = NumericalGuard(tolerance=tol)
     g_many.history = [_record(i, 1000.0, 1000.0) for i in range(130)] + \
-        [benign(i) for i in range(20)]
-    assert g_many.diverged, "13% over-tolerance, however reproducible, is systematic"
+        [_record(i, 1005.0, 1000.0) for i in range(20)]
+    assert g_many.diverged, "13% over-tolerance is systematic divergence"
+
+
+def test_guard_flags_any_nonfinite_check_regardless_of_rate():
+    """Overflow/NaN is divergence even as a lone check -- the rate tolerance is
+    for heavy-tail fp32 gaps, never for a non-finite result."""
+    tol = 1e-3
+    g = NumericalGuard(tolerance=tol)
+    clean = [_record(i, 1000.0, 1000.0) for i in range(149)]
+    nan_rec = {"step": 9200, "device_loss": float("nan"), "reference_loss": 1000.0,
+               "relative_difference": float("inf")}
+    g.history = clean + [nan_rec]
+    assert g.diverged, "one non-finite check is divergence regardless of rate"
 
 
 def test_guard_summary_is_safe_before_any_check():

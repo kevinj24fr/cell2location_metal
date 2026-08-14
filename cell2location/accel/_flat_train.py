@@ -361,44 +361,19 @@ def _flat_guard_check(guard, module, state, args, kwargs, epoch, log_joint_fn=No
     if not math.isfinite(relative_difference):
         # Non-finite must read as divergence, never as agreement.
         relative_difference = float("inf")
-
-    # Distinguish a benign heavy-tail draw from real device corruption. A single
-    # SVI draw is heavy-tailed (a rare extreme sample makes one log-joint term
-    # dominate), and on such a draw device and CPU fp32 genuinely differ in the
-    # last bits amplified to a large RELATIVE gap -- but the DEVICE result is
-    # reproducible, and training (which stays on device) is unaffected. Real
-    # corruption (e.g. the fused-kernel dispatch race, proven non-reproducible at
-    # fixed latents) gives a DIFFERENT device answer on re-evaluation. So when a
-    # check exceeds tolerance, re-run the device log-joint at the SAME latents:
-    # reproducible => heavy-tail, benign; non-reproducible => corruption. Only
-    # finite, over-tolerance, reproducible checks are exonerated; a non-finite
-    # difference stays divergence unconditionally.
-    reproducible = None
-    if relative_difference > guard.tolerance and math.isfinite(relative_difference):
-        with torch.no_grad():
-            try:
-                device_loss2 = float(log_joint_fn(module, args, kwargs, latents, *extra))
-                repro_gap = abs(device_loss2 - device_loss) / max(abs(device_loss), 1e-12)
-                reproducible = math.isfinite(repro_gap) and repro_gap <= guard.tolerance
-            except Exception as exc:  # noqa: BLE001 - a failed recheck is not agreement
-                logger.warning("Flat guard: reproducibility recheck failed (%s).", exc)
-                reproducible = False
-
     record = {
         "step": epoch,
         "device_loss": device_loss,
         "reference_loss": reference_loss,
         "relative_difference": relative_difference,
-        "reproducible_benign": bool(reproducible),
     }
     guard.history.append(record)
     if relative_difference > guard.tolerance:
-        kind = ("reproducible (heavy-tail draw; device is self-consistent, "
-                "training unaffected)" if reproducible else "NON-reproducible (device corruption)")
         logger.warning(
             "Numerical guard (flat engine): epoch %d log-joint differs by %.3g between "
-            "the GPU and CPU (%.6g vs %.6g, tolerance %.3g) -- %s.",
-            epoch, relative_difference, device_loss, reference_loss, guard.tolerance, kind,
+            "the GPU and CPU (%.6g vs %.6g, tolerance %.3g). One such check among many "
+            "is a heavy-tail draw; a high rate is real divergence.",
+            epoch, relative_difference, device_loss, reference_loss, guard.tolerance,
         )
     return record
 
