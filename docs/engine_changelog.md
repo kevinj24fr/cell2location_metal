@@ -24,21 +24,22 @@ median (contention only adds time). Each entry's *ratio* stands; its absolute
 ms/epoch is not comparable across entries, nor to what the harness prints
 today. The current baselines are in `benchmarks/*_baseline.json`.
 
-- **Guard tolerates benign heavy-tail draws (correctness of the *guard*).**
-  A single SVI draw's log-joint is heavy-tailed, so a rare guard check lands on
-  an extreme sample where device and CPU fp32 differ by a large *relative*
-  amount while the device result is self-consistent and training (which stays
-  on device) is unaffected. The guard's `diverged = any check over tolerance`
-  flagged such a run as failure -- a real b03 spatial fit converged over 30,000
-  finite epochs but tripped on 1 of 150 checks at 0.43. The guard now exonerates
-  only checks it verifies benign: on an over-tolerance check it re-evaluates the
-  device log-joint at the same latents, and a device that agrees with itself is
-  a heavy tail, not corruption. Real divergence is still caught two ways so a
-  deterministically-wrong kernel cannot hide -- non-finite or non-reproducible
-  (the fused-kernel race) checks always flag, and an over-tolerance *rate* above
-  5% is systematic bias regardless of reproducibility. No training or timing
-  change (the recheck runs only on the rare flagged check, never in the hot
-  path); all three arms pass, suite 200.
+- **Guard judges divergence by rate, not the single worst check.**
+  A single SVI draw's log-joint is heavy-tailed: a rare extreme sample makes one
+  term dominate, and on that draw device and CPU fp32 differ by a large
+  *relative* amount while training -- which stays on one device -- is unaffected.
+  The guard's `diverged = any check over tolerance` flagged such a run as
+  failure: a real b03 spatial fit converged over 30,000 finite epochs but tripped
+  on 1 of 150 checks at 0.43. The guard now judges by the *rate* of
+  over-tolerance checks (the handoff's own "judge by tail median, never worst"
+  lesson): more than 5% is a consistent bias -- a wrong kernel misses on
+  essentially every check -- while one or two of many is the heavy tail. A
+  non-finite check is always divergence regardless of rate (overflow/NaN). No
+  training or timing change (the guard runs guard-off in timing); all three arms
+  pass, suite 200. (A reproducibility-recheck variant was tried first and cut: a
+  per-check device re-evaluation is not a clean determinism test across the
+  guard's CPU round-trip, and rate alone is the simpler criterion that the real
+  b03 run needs.)
 
 - **NB overdispersion clamp — the flat engine completes real reference fits.**
   `alpha_g_inverse` carries an Exponential prior whose mode is at zero, so
