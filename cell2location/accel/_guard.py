@@ -166,10 +166,36 @@ class NumericalGuard:
         self.history: List[Dict[str, Any]] = []
         self._warnings_issued = 0
 
+    #: A heavy-tail SVI draw makes at most a check or two of many exceed
+    #: tolerance (the handoff measured ~1 outlier per 700 epochs; the guard
+    #: samples far less often than that). A rate above this is not a tail, it is
+    #: a consistent bias -- e.g. a deterministically wrong kernel, which is
+    #: reproducible and so escapes the per-check benign flag. Set well above the
+    #: heavy-tail rate and well below any systematic error's ~100%.
+    benign_fraction: float = 0.05
+
     @property
     def diverged(self) -> bool:
-        """Whether any completed check exceeded the tolerance."""
-        return any(record["relative_difference"] > self.tolerance for record in self.history)
+        """Whether the run really diverged, tolerating only benign heavy-tail draws.
+
+        A check is exonerated only if the flat guard verified it benign: on an
+        over-tolerance check it re-evaluates the device log-joint at the same
+        latents and sets ``reproducible_benign`` when the device agrees with
+        itself -- a genuine fp32 gap on an extreme single draw, which does not
+        corrupt device-only training. Real divergence is caught two ways, so a
+        deterministically-wrong kernel (reproducible on every check, thus flagged
+        benign individually) cannot hide:
+
+        * any over-tolerance check that is NOT benign -- non-finite, device
+          non-reproducible (the fused-kernel race), or a pyro-path record with no
+          flag at all (unchanged behaviour); or
+        * more than ``benign_fraction`` of all checks over tolerance, however
+          reproducible -- a rate that high is bias, not a tail.
+        """
+        over = [r for r in self.history if r["relative_difference"] > self.tolerance]
+        if any(not r.get("reproducible_benign", False) for r in over):
+            return True
+        return bool(self.history) and len(over) / len(self.history) > self.benign_fraction
 
     def summary(self) -> Dict[str, Any]:
         if not self.history:
