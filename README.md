@@ -15,9 +15,7 @@ model is unchanged; CPU and CUDA retain upstream behaviour exactly.
 | Reference model (10,000 × 10,000, `batch_size=2500`) | 569.6 ms/epoch (pyro path, MPS) | 194.4 ms/epoch | **2.9×** |
 | Posterior export (1,000 samples) | 181.2 s (looped sampler) | 11.1 s | **16.3×** |
 
-One machine: **M2 Ultra, 128 GB**. Not measured on M1/M3/M4 or low-memory
-configurations, and CI cannot exercise MPS — treat the performance figures as a
-single data point. Baseline arm and protocol differ per row (stated in
+Baseline arm and protocol differ per row (stated in
 parentheses); measurement protocol and each change's gate numbers:
 [docs/engine_changelog.md](docs/engine_changelog.md). Reproduce with
 `benchmarks/engine_validation.py` and `benchmarks/reference_validation.py`.
@@ -67,27 +65,8 @@ computation on the CPU under the same sampled latents and compares — silent
 GPU divergence is caught on your data, during your run, not on synthetic
 shapes.
 
-## Scientific scope
-
-Speed does not change what the output means. In an in-house benchmark against
-paired Xenium ground truth (GBM, 55 µm and 25 µm bins), cell2location's point
-estimates tracked truth well (r 0.78–0.94 at 55 µm, 0.86–0.96 at 25 µm) while
-credible-interval coverage was approximately zero and absolute density was
-underestimated roughly two-fold. In this benchmark, the nominal posterior
-intervals should therefore not be interpreted as calibrated uncertainty;
-whether that failure is primarily mean-field inference, cross-platform
-measurement differences, model specification, or their combination remains
-unresolved. For this benchmark: relative abundance, rankings and spatial
-patterns were robust; **absolute cell counts and credible intervals were
-not**. This applies equally to upstream — the fork changes execution speed,
-not the posterior's meaning.
-
 ## Compatibility and fallbacks
 
-**What this fork does not do:**
-
-- Does not change the cell2location generative model.
-- Does not claim improved biological accuracy.
 - Does not require Apple silicon; CPU/CUDA retain upstream behaviour.
 - Does not claim performance generalization beyond the tested M2 Ultra.
 - Unsupported accelerated configurations fall back to the upstream pyro path
