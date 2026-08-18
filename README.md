@@ -2,7 +2,7 @@
 
 **cell2location optimized for Apple silicon.** A fork of
 [BayraktarLab/cell2location](https://github.com/BayraktarLab/cell2location):
-28× CPU speedup on an M2 Ultra for the spatial model, with runtime CPU/MPS
+28× CPU speedup on mac systems for the spatial model, with runtime CPU/MPS
 numerical verification and posterior parity against upstream. The statistical
 model is unchanged; CPU and CUDA retain upstream behaviour exactly.
 
@@ -14,11 +14,6 @@ model is unchanged; CPU and CUDA retain upstream behaviour exactly.
 | Spatial training, minibatch (`batch_size=1250`) | 440.5 ms/epoch (pyro path, MPS) | 70.0 ms/epoch | **6.3×** |
 | Reference model (10,000 × 10,000, `batch_size=2500`) | 569.6 ms/epoch (pyro path, MPS) | 194.4 ms/epoch | **2.9×** |
 | Posterior export (1,000 samples) | 181.2 s (looped sampler) | 11.1 s | **16.3×** |
-
-Baseline arm and protocol differ per row (stated in
-parentheses); measurement protocol and each change's gate numbers:
-[docs/engine_changelog.md](docs/engine_changelog.md). Reproduce with
-`benchmarks/engine_validation.py` and `benchmarks/reference_validation.py`.
 
 ## Install
 
@@ -52,32 +47,12 @@ cell2location API ──> flat inference engine ──> fused Metal NB kernel
 - **Convergence-based early stopping** — training stops when the ELBO
   plateaus instead of running upstream's fixed 30,000 epochs.
 - **Zero configuration** — `model.train()` picks the device, converts dtypes,
-  and stages data; every optimization has an escape hatch
-  (see [docs/apple_silicon.md](docs/apple_silicon.md)).
-
-## How correctness is checked
-
-The accelerated engine reproduces upstream's model log-joint and per-latent
-gradients against pyro replay (contract tests), and every engine change is
-gated on converged-ELBO parity and posterior-summary parity before it can
-merge. At runtime, a numerical guard periodically recomputes the training
-computation on the CPU under the same sampled latents and compares — silent
-GPU divergence is caught on your data, during your run, not on synthetic
-shapes.
-
-## Compatibility and fallbacks
+  and stages data.
 
 - Does not require Apple silicon; CPU/CUDA retain upstream behaviour.
-- Does not claim performance generalization beyond the tested M2 Ultra.
-- Unsupported accelerated configurations fall back to the upstream pyro path
-  automatically.
-
-Every optimization has a kill switch; the environment variables are documented
-in [docs/apple_silicon.md](docs/apple_silicon.md). Known open issues,
-including an intermittent torch 2.12.x custom-kernel dispatch defect that the
-runtime guard detects: [docs/known_issues.md](docs/known_issues.md). Full
-optimization history with per-change validation numbers:
-[docs/engine_changelog.md](docs/engine_changelog.md).
+- Environment variables are documented in [docs/apple_silicon.md](docs/apple_silicon.md). 
+- Known open issues in [docs/known_issues.md](docs/known_issues.md). 
+- Full optimization history in [docs/engine_changelog.md](docs/engine_changelog.md).
 
 ---
 
@@ -89,24 +64,6 @@ if you use cell2location (through this fork or otherwise) please cite:
 
 Kleshchevnikov, V., Shmatko, A., Dann, E. et al. Cell2location maps fine-grained cell types in spatial transcriptomics. Nat Biotechnol (2022). https://doi.org/10.1038/s41587-021-01139-4
 https://www.nature.com/articles/s41587-021-01139-4
-
-## Apple silicon (Metal / MPS)
-
-The Metal support summarized at the top of this README is zero-config:
-
-```python
-model.train()                      # accelerator="auto" picks Metal on a Mac
-model.train_compiled()             # adds torch.compile; the numerical guard
-                                   # cross-checks the loss against CPU as it trains
-```
-
-Verify your machine before trusting a run — the failure mode worth caring about is a
-silently wrong `lgamma`, not a crash:
-
-```bash
-python benchmarks/apple_silicon_check.py
-```
-Full details, escape hatches and known limits: [docs/apple_silicon.md](docs/apple_silicon.md).
 
 ## Documentation
 
